@@ -2,8 +2,10 @@
 import asyncio
 from system_container import HousePadiSystem
 from agent_engine.registry import AgentManifest
-# app/tests/test_utils.py
 import json
+
+from dotenv import load_dotenv
+load_dotenv()  # This reads the .env file and injects variables into os.environ
 
 class MockClientWebSocket:
     """Simulates the frontend WebSocket stream for integration testing."""

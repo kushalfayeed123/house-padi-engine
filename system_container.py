@@ -10,28 +10,27 @@ from voice_engine.stream_handler import AudioStreamOrchestrator
 class HousePadiSystem:
 
     def __init__(self):
-        # 1. Centralized Database Initialization
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        url = os.getenv("SUPABASE_URL") or ""
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or ""
+        db_url = os.getenv("DATABASE_URL") or ""  # Required for the connection pool
 
-        if not url:
-            raise ValueError("Environment variable 'SUPABASE_URL' is not set.")
-        if not key:
-            raise ValueError("Environment variable 'SUPABASE_SERVICE_ROLE_KEY' is not set.")
+        if not all([url, key, db_url]):
+            raise ValueError("Required environment variables (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DATABASE_URL) are not set.")
         
         self.supabase: Client = create_client(url, key)
-        
-        # 2. Data Layer Injection
+      
         self.oracle = OracleMCPServer(supabase_client=self.supabase)
         
-        # 3. Registry & Reasoning Layer
         self.registry = HousePadiAgentRegistry()
         llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.0)
+        
+        # Inject the db_pool here
         self.orchestrator = PadiGraphOrchestrator(
             registry=self.registry,
             llm_client=llm,
-            oracle=self.oracle
+            oracle=self.oracle,
+            db_url=db_url
         )
         
-        # 4. Voice Layer
+        # 5. Voice Layer
         self.voice_handler = AudioStreamOrchestrator(graph_orchestrator=self.orchestrator)

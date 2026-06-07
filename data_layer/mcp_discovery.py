@@ -1,54 +1,40 @@
-import logging
-from typing import Dict, List, Any, cast
-import openai
-from pydantic import BaseModel, Field
+import json
+from typing import List, Dict, Any, cast, Optional
+from langchain_core.tools import tool
+from sentence_transformers import SentenceTransformer
 from supabase import Client
 
-logger = logging.getLogger(__name__)
+# Use Optional so the type checker understands it starts as None
+_client: Optional[Client] = None
+_model: Optional[SentenceTransformer] = None
 
+def set_discovery_resources(client: Client) -> None:
+    global _client, _model
+    _client = client
+    _model = SentenceTransformer('all-MiniLM-L6-v2')
 
-class SemanticSearchSchema(BaseModel):
-    query: str = Field(..., description="The semantic descriptor (e.g., 'abundant natural lighting').")
-    max_budget: float = Field(default=float('inf'), description="Maximum currency cap value.")
+def _get_resources() -> tuple[Client, SentenceTransformer]:
+    """Helper to ensure resources are initialized before use."""
+    if _client is None or _model is None:
+        raise RuntimeError("Discovery MCP resources not initialized. Call set_discovery_resources() first.")
+    return _client, _model
 
-
-class DiscoveryMCPServer:
-
-    def __init__(self, supabase_client: Client):
-        # We inject the client here, established in main.py/container
-        self.client = supabase_client
-        self.openai_client = openai.OpenAI()  # Uses OPENAI_API_KEY from env
-
-    def get_tool_signature(self) -> Dict[str, Any]:
-        return {
-            "name": "search_semantic_listings",
-            "description": "Scans real estate catalogs using natural text descriptions via pgvector.",
-            "parameters": SemanticSearchSchema.model_json_schema()
-        }
-
-    def execute_tool(self, arguments: Dict[str, Any]) -> List[Dict[str, Any]]:
-        try:
-            validated_args = SemanticSearchSchema(**arguments)
-            
-            # 1. Generate embedding for the user's natural language query
-            embedding_response = self.openai_client.embeddings.create(
-                input=validated_args.query,
-                model="text-embedding-3-small"
-            )
-            query_embedding = embedding_response.data[0].embedding
-            
-            # 2. Call the Supabase RPC
-            response = self.client.rpc(
-                "match_properties",
-                {
-                    "query_embedding": query_embedding,
-                    "budget_limit": validated_args.max_budget,
-                    "match_threshold": 0.5
-                }
-            ).execute()
-            
-            return cast(List[Dict[str, Any]], response.data or [])
-            
-        except Exception as e:
-            logger.error(f"Vector search failed: {str(e)}")
-            return []
+@tool
+def search_semantic_listings(query: str, max_budget: float = 999999999999.0) -> str:
+    """
+    Scans real estate catalogs using natural text descriptions via vector similarity.
+    """
+    client, model = _get_resources()
+    
+    # Generate embedding
+    embedding = model.encode(query).tolist()
+    
+    # Call the Supabase RPC
+    response = client.rpc("match_properties", {
+        "query_embedding": embedding,
+        "budget_limit": max_budget,
+        "match_threshold": 0.5
+    }).execute()
+    
+    # Cast explicitly to avoid JSON structure warnings
+    return json.dumps({"status": "success", "matches": response.data})
