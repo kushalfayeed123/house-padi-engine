@@ -1,11 +1,14 @@
 import json
+import logging
 from typing import Dict, Any, List, Optional, cast
 import uuid
 from langchain_core.tools import tool
 from supabase import Client
+from data_layer.vector_service import vectorize_property_data
 
 # Global state initialized safely
 _supabase_client: Optional[Client] = None
+logger = logging.getLogger(__name__)
 
 
 def set_client(client: Client) -> None:
@@ -18,34 +21,87 @@ def _get_client() -> Client:
         raise RuntimeError("Supabase client not initialized. Call set_client() before using tools.")
     return _supabase_client
 
+
+def format_tool_output(data: Any) -> str:
+    """Ensures tool output is a JSON string, handling potential errors."""
+    if isinstance(data, str):
+        return data
+    try:
+        return json.dumps(data)
+    except (TypeError, ValueError):
+        return str(data)
+
 # --- Core Tools ---
 
 
 @tool
-def create_property(address: str, base_price: float, internal_code: Optional[str], specs: Dict[str, Any]) -> str:
+def add_new_property_record(address: str, location: str, base_price: float, internal_code: Optional[str], specs: Dict[str, Any]) -> str:
     """Creates a new property record and returns the new property ID."""
     client = _get_client()
     
-    # Auto-generate code if missing for better UX
+    # 1. CHECK FOR EXISTING (Defensive)
+    try:
+        existing = client.table("properties").select("id").eq("address", address).execute()
+        # Verify if data exists BEFORE accessing index 0
+        raw_data = existing.data
+        if isinstance(raw_data, list) and len(raw_data) > 0:
+            item = cast(Dict[str, Any], raw_data[0])
+            
+            return json.dumps({"status": "ALREADY_EXISTS", "id": item['id']})
+    except Exception as e:
+        logger.error(f"Error checking for existing property: {e}")
+        # Proceed to creation or return error; usually safer to let it try to create if check fails
+    
+    # 2. CREATE
     if not internal_code:
         internal_code = f"PROP-{uuid.uuid4().hex[:6].upper()}"
         
-    response = client.table("properties").insert({
-        "address": address,
-        "base_price": base_price,
-        "internal_code": internal_code,
-        "specs": specs or {}
-    }).execute()
-    raw_item = response.data[0]
-    
-    item = cast(Dict[str, Any], raw_item)
-    
-    return json.dumps({"status": "SUCCESS", "id": item['id']})
+    try:
+        response = client.table("properties").insert({
+            "address": address,
+            "base_price": base_price,
+            "location": location,  # New field
+            "internal_code": internal_code,
+            "specs": specs or {}
+        }).execute()
+        
+        if not response.data:
+            return json.dumps({"status": "ERROR", "message": "Failed to insert property"})
+            
+        item = cast(Dict[str, Any], response.data[0])
+        property_id = item['id']
+        
+        # 3. VECTORIZE
+        try:
+            embedding = vectorize_property_data(address, location, specs)
+            client.table("properties").update({
+                "vector_embedding": embedding
+            }).eq("id", property_id).execute()
+        except Exception as e:
+            logger.error(f"Vectorization failed for {property_id}: {e}")
+            # We continue because the property is already created
+        
+        return json.dumps({"status": "SUCCESS", "id": property_id})
+        
+    except Exception as e:
+        return json.dumps({"status": "ERROR", "message": str(e)})
+
+
+def is_valid_uuid(val):
+    try:
+        uuid.UUID(str(val))
+        return True
+    except ValueError:
+        return False
 
 
 @tool
-def get_property_details(property_id: str) -> Dict[str, Any]:
-    """Fetches full metadata and current status for a specific property."""
+def fetch_property_by_uuid(property_id: str) -> Dict[str, Any]:
+    """
+   REQUIRED: Provide a specific property_id (UUID).
+    DO NOT use this tool to add, create, or register new properties.
+    If you have creation data (address, price, features), you must use 'add_new_property_record'.
+    """
     client = _get_client()
     response = client.table("properties").select("*").eq("id", property_id).single().execute()
     return cast(Dict[str, Any], response.data) if response.data else {}
@@ -54,6 +110,9 @@ def get_property_details(property_id: str) -> Dict[str, Any]:
 @tool
 def update_property(property_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
     """Updates property fields (e.g., status, price, owner)."""
+    if not is_valid_uuid(property_id):
+        raise ValueError(f"Agent attempted to use an invalid property ID: {property_id}. "
+                         "This is likely a hallucinated placeholder.")
     client = _get_client()
     response = client.table("properties").update(update_data).eq("id", property_id).execute()
     data = cast(List[Any], response.data)
@@ -63,6 +122,9 @@ def update_property(property_id: str, update_data: Dict[str, Any]) -> Dict[str, 
 @tool
 def delete_property(property_id: str) -> Dict[str, Any]:
     """Soft deletes a property record."""
+    if not is_valid_uuid(property_id):
+        raise ValueError(f"Agent attempted to use an invalid property ID: {property_id}. "
+                         "This is likely a hallucinated placeholder.")
     client = _get_client()
     client.table("properties").update({"deleted_at": "now()"}).eq("id", property_id).execute()
     return {"status": "SUCCESS"}
@@ -83,6 +145,9 @@ def log_property_history(property_id: str, event_type: str, payload: Dict[str, A
 @tool
 def create_inspection(property_id: str, inspector_name: str, date: str) -> Dict[str, Any]:
     """Schedules a new property inspection."""
+    if not is_valid_uuid(property_id):
+        raise ValueError(f"Agent attempted to use an invalid property ID: {property_id}. "
+                         "This is likely a hallucinated placeholder.")
     client = _get_client()
     response = client.table("inspections").insert({
         "property_id": property_id, "inspector": inspector_name, "scheduled_date": date
@@ -92,8 +157,14 @@ def create_inspection(property_id: str, inspector_name: str, date: str) -> Dict[
 
 
 @tool
-def get_property_ledger(property_id: str) -> List[Dict[str, Any]]:
-    """Retrieves all financial and maintenance records for a property."""
+def get_ledger(property_id: str) -> str:
+    """Fetches the ledger for a specific property."""
     client = _get_client()
-    response = client.table("ledger").select("*").eq("property_id", property_id).execute()
-    return cast(List[Dict[str, Any]], response.data) if response.data else []
+    try:
+        response = client.table("ledger").select("*").eq("property_id", property_id).execute()
+        
+        # Use the helper to force string serialization
+        return format_tool_output(response.data)
+        
+    except Exception as e:
+        return json.dumps({"status": "ERROR", "message": str(e)})

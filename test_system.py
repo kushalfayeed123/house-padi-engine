@@ -28,7 +28,7 @@ orchestrator = PadiGraphOrchestrator(
 
 # 2. Simulate User Request (CORRECTED: Use HumanMessage object)
 test_payload = {
-    "messages": [HumanMessage(content="Create a new property for me at 123 Lagos St, $500k")],
+    "messages": [HumanMessage(content="Create a new 1 bedroom property for me at 30 Christ Avenue, Lekki Phase 1, Lagos, $200k per year")],
     "transaction_context": {"property_id": None}
 }
 

@@ -12,13 +12,13 @@ class OracleMCPServer:
         # Complete inventory of all available tools
         self._tool_map = {
             "search_semantic_listings": mcp_discovery.search_semantic_listings,
-            "create_property": mcp_transaction.create_property,
-            "get_property_details": mcp_transaction.get_property_details,
+            "add_new_property_record": mcp_transaction.add_new_property_record,
+            "fetch_property_by_uuid": mcp_transaction.fetch_property_by_uuid,
             "update_property": mcp_transaction.update_property,
             "delete_property": mcp_transaction.delete_property,
             "log_property_history": mcp_transaction.log_property_history,
             "create_inspection": mcp_transaction.create_inspection,
-            "get_property_ledger": mcp_transaction.get_property_ledger,
+            "get_property_ledger": mcp_transaction.get_ledger,
         }
 
     def get_all_tools(self) -> List[Any]:

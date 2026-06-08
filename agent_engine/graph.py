@@ -3,7 +3,7 @@ import logging
 from typing import Annotated, TypedDict, List, Dict, Any, cast
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, SystemMessage, AIMessage # 1. Import AIMessage
+from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, ToolMessage # 1. Import AIMessage
 from langgraph.prebuilt import ToolNode
 from agent_engine.registry import HousePadiAgentRegistry
 from data_layer.mcp_oracle import OracleMCPServer
@@ -15,6 +15,7 @@ class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     current_agent: str
     transaction_context: Dict[str, Any]
+    search_performed: bool
 
 
 class PadiGraphOrchestrator:
@@ -50,14 +51,24 @@ class PadiGraphOrchestrator:
         return {"current_agent": "discovery"}
 
     def _execute_agent_node(self, agent_name: str):
-
         def node(state: AgentState) -> Dict[str, Any]:
             manifest = self.registry.resolve_agent(agent_name)
             
-            # PRODUCTION FIX: Bind ALL tools available in the Oracle.
-            # This prevents 400 Bad Request errors by giving the LLM full access.
+            # 1. Get the full master list of tools
             all_tools = self.oracle.get_all_tools()
-            llm_with_tools = self.llm.bind_tools(all_tools)
+            
+            # 2. FILTER: Only bind tools that appear in the agent's authorized list
+            # We assume tool.name matches the string in manifest.authorized_mcp_tools
+            allowed_tools = [
+                t for t in all_tools 
+                if t.name in manifest.authorized_mcp_tools
+            ]
+            
+            # Debugging check
+            logger.info(f"Agent '{agent_name}' authorized tools: {[t.name for t in allowed_tools]}")
+            
+            # 3. Bind only the allowed subset
+            llm_with_tools = self.llm.bind_tools(allowed_tools)
             
             # Context fetch
             context = self.oracle.execute_tool("context_fetcher", {"property_id": state.get("transaction_context", {}).get("property_id")})
@@ -66,7 +77,14 @@ class PadiGraphOrchestrator:
                 content=f"{manifest.system_instructions}\n\nSYSTEM CONTEXT: {context}"
             )
             
-            response = llm_with_tools.invoke([system_msg] + state["messages"])
+            try:
+                response = llm_with_tools.invoke([system_msg] + state["messages"])
+            except Exception as e:
+                logger.error(f"Error occurred while invoking LLM for agent '{agent_name}': {e}")
+                if "validation failed" in str(e):
+                    logger.error("Routing Error: The agent attempted the wrong tool.")
+                raise
+
             return {"messages": [response], "current_agent": agent_name}
 
         return node
@@ -79,6 +97,13 @@ class PadiGraphOrchestrator:
         # If the LLM made a tool call, route to 'tools'
         if isinstance(last_message, AIMessage) and last_message.tool_calls:
             return "tools"
+        
+        if isinstance(last_message, ToolMessage):
+            if "ERROR" in last_message.content or "ALREADY_EXISTS" in last_message.content:
+                return END
+        
+        if state.get("search_performed"):
+            return "finish"
         
         # Otherwise, stop
         return END
