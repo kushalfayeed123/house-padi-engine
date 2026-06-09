@@ -1,17 +1,21 @@
 # app/data_layer/mcp_oracle.py
 from typing import List, Dict, Any
+from pydantic import BaseModel, Field
 from supabase import Client
 from data_layer import mcp_transaction, mcp_discovery
 
+
+
 class OracleMCPServer:
-    def __init__(self, supabase_client: Client):
+    def __init__(self, supabase_client: Client, embedding_model):
         self.client = supabase_client
+        self.model = embedding_model
+        self.search_tool = mcp_discovery.create_search_tool(self.model, self.client)
         mcp_transaction.set_client(supabase_client)
-        mcp_discovery.set_discovery_resources(supabase_client)
         
         # Complete inventory of all available tools
         self._tool_map = {
-            "search_semantic_listings": mcp_discovery.search_semantic_listings,
+            "search_semantic_listings": mcp_discovery.create_search_tool(self.model, self.client),
             "add_new_property_record": mcp_transaction.add_new_property_record,
             "fetch_property_by_uuid": mcp_transaction.fetch_property_by_uuid,
             "update_property": mcp_transaction.update_property,

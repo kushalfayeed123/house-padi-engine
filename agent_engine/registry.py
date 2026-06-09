@@ -91,9 +91,9 @@ class HousePadiAgentRegistry:
         # 2. Broker
         self.register_agent(AgentManifest(
             name="broker",
-            description="Handles property onboarding and initial auditing.",
+            description="Handles property onboarding only.",
             system_instructions=broker_prompts.get("system_instructions", ""),
-            authorized_mcp_tools=["add_new_property_record", "log_property_history", "fetch_property_by_uuid"]
+            authorized_mcp_tools=["add_new_property_record"]
         ))
 
         # 3. Manager
@@ -106,3 +106,7 @@ class HousePadiAgentRegistry:
                 "update_property", "fetch_property_by_uuid"
             ]
         ))
+        
+
+    def is_valid_agent(self, name: str) -> bool:
+        return name in self._registry

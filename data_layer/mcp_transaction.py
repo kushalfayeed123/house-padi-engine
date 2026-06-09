@@ -3,6 +3,7 @@ import logging
 from typing import Dict, Any, List, Optional, cast
 import uuid
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field, field_validator
 from supabase import Client
 from data_layer.vector_service import vectorize_property_data
 
@@ -34,7 +35,29 @@ def format_tool_output(data: Any) -> str:
 # --- Core Tools ---
 
 
-@tool
+class AddPropertyInput(BaseModel):
+    address: str
+    location: str
+    base_price: float
+    internal_code: Optional[str] = None
+    specs: Dict[str, Any] = Field(..., description="Details like bedrooms, bathrooms, and amenities.")
+
+    @field_validator("specs")
+    @classmethod
+    def validate_specs(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        # 1. Ensure it's not empty
+        if not v:
+            raise ValueError("Specs cannot be empty. Must include 'bedrooms', 'bathrooms', etc.")
+        
+        # 2. Optional: Ensure at least one critical key exists (or leave logic to LLM)
+        required_keys = {"bedrooms"}
+        if not any(k in v.keys() for k in required_keys):
+             # You can raise a ValueError here to force the agent to retry with better info
+             pass 
+        return v
+
+
+@tool(args_schema=AddPropertyInput)
 def add_new_property_record(address: str, location: str, base_price: float, internal_code: Optional[str], specs: Dict[str, Any]) -> str:
     """Creates a new property record and returns the new property ID."""
     client = _get_client()
@@ -55,6 +78,8 @@ def add_new_property_record(address: str, location: str, base_price: float, inte
     # 2. CREATE
     if not internal_code:
         internal_code = f"PROP-{uuid.uuid4().hex[:6].upper()}"
+    
+    safe_specs = specs or {}
         
     try:
         response = client.table("properties").insert({
@@ -62,7 +87,7 @@ def add_new_property_record(address: str, location: str, base_price: float, inte
             "base_price": base_price,
             "location": location,  # New field
             "internal_code": internal_code,
-            "specs": specs or {}
+            "specs": safe_specs
         }).execute()
         
         if not response.data:
@@ -103,20 +128,33 @@ def fetch_property_by_uuid(property_id: str) -> Dict[str, Any]:
     If you have creation data (address, price, features), you must use 'add_new_property_record'.
     """
     client = _get_client()
-    response = client.table("properties").select("*").eq("id", property_id).single().execute()
-    return cast(Dict[str, Any], response.data) if response.data else {}
+    response = client.table("properties").select("*").eq("id", property_id).maybe_single().execute()
+    if response is None:
+        return {"error": "Internal Database Error"}
+        
+    # 2. Handle missing data (maybe_single returns None for data if not found)
+    if response.data is None:
+        return {"error": "Property not found"}
+        
+    # 3. Explicitly cast the dynamic 'data' to the expected Dict[str, Any]
+    # This silences the type checker and confirms you are handling the dynamic return
+    return cast(Dict[str, Any], response.data)
 
 
 @tool
 def update_property(property_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Updates property fields (e.g., status, price, owner)."""
+    """Updates property fields."""
     if not is_valid_uuid(property_id):
-        raise ValueError(f"Agent attempted to use an invalid property ID: {property_id}. "
-                         "This is likely a hallucinated placeholder.")
+        raise ValueError(f"Invalid UUID: {property_id}")
+        
     client = _get_client()
     response = client.table("properties").update(update_data).eq("id", property_id).execute()
-    data = cast(List[Any], response.data)
-    return cast(Dict[str, Any], data[0]) if data else {"status": "SUCCESS"}
+    
+    # Defensive list access
+    if response.data and len(response.data) > 0:
+        return cast(Dict[str, Any], response.data[0])
+    
+    return {"status": "ERROR", "message": "Property not found or update failed"}
 
 
 @tool
@@ -132,14 +170,28 @@ def delete_property(property_id: str) -> Dict[str, Any]:
 
 @tool
 def log_property_history(property_id: str, event_type: str, payload: Dict[str, Any]) -> str:
-    """Logs an event (e.g., 'creation', 'inspection') to the property history."""
+    """Logs an event to the property history."""
     client = _get_client()
-    client.table("property_history").insert({
-        "property_id": property_id,
-        "event_type": event_type,
-        "payload": payload
-    }).execute()
-    return json.dumps({"status": "LOGGED"})
+    
+    # 1. VERIFY: Ensure property exists first
+    check = client.table("properties").select("id").eq("id", property_id).maybe_single().execute()
+    if check is None:
+        return json.dumps({"status": "ERROR", "message": "Database connection failure"})
+
+    # Guard clause for the data property
+    if check.data is None:
+        return json.dumps({"status": "ERROR", "message": f"Cannot log history: Property {property_id} does not exist."})
+        # 2. INSERT: Only if verified
+    try:
+        client.table("property_history").insert({
+            "property_id": property_id,
+            "event_type": event_type,
+            "payload": payload
+        }).execute()
+        return json.dumps({"status": "LOGGED"})
+    except Exception as e:
+        logger.error(f"Failed to log history: {e}")
+        return json.dumps({"status": "ERROR", "message": str(e)})
 
 
 @tool

@@ -1,48 +1,120 @@
-# app/main.py
-import asyncio
-from system_container import HousePadiSystem
-from agent_engine.registry import AgentManifest
-import json
-
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
-load_dotenv()  # This reads the .env file and injects variables into os.environ
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
 
-class MockClientWebSocket:
-    """Simulates the frontend WebSocket stream for integration testing."""
-    def __init__(self):
-        self.messages = [
-            b"\x00\x01\x02\x03", 
-            json.dumps({"event": "interrupt"})
-        ]
-        self.index = 0
+# Ensure this matches your file structure
+from system_container import HousePadiSystem 
 
-    def __aiter__(self): 
+# 1. Configuration
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("house_padi_server")
+
+
+# 2. Bridge Adapter
+class FastAPIWebSocketAdapter:
+    """
+    Adapts the FastAPI WebSocket to the interface required 
+    by AudioStreamOrchestrator (send + __aiter__).
+    """
+
+    def __init__(self, websocket: WebSocket):
+        self.websocket = websocket
+
+    async def send(self, data: bytes):
+        """Sends audio data from the system to the client."""
+        await self.websocket.send_bytes(data)
+
+    def __aiter__(self):
         return self
 
     async def __anext__(self):
-        if self.index < len(self.messages):
-            msg = self.messages[self.index]
-            self.index += 1
-            return msg
-        raise StopAsyncIteration
+        """Receives audio data from the client, converts to stream."""
+        try:
+            data = await self.websocket.receive_bytes()
+            return data
+        except WebSocketDisconnect:
+            raise StopAsyncIteration
 
-    async def send(self, data: bytes):
-        pass
 
-async def main():
-    system = HousePadiSystem()
+# 3. Lifespan Manager (Modern Replacement for on_event)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handles startup and shutdown lifecycle."""
+    try:
+        # Startup
+        app.state.system = HousePadiSystem()
+        app.state.system.run_health_check()
+        logger.info("--- House Padi System Operational & Ready ---")
+    except Exception as e:
+        logger.error(f"System failed to initialize: {e}")
+        raise e
     
-    # Register agents into the system
-    system.registry.register_agent(AgentManifest(
-        name="discovery",
-        description="Handles property search via discovery MCP.",
-        system_instructions="You are Padi. Use discovery tool for searches."
-    ))
+    yield  # Application running
+    
+    # Shutdown
+    logger.info("--- House Padi System Shutting Down ---")
 
-    # Run the voice pipeline
-    print("--- House Padi System Operational ---")
-    mock_socket = MockClientWebSocket() # Your existing mock
-    await system.voice_handler.handle_voice_session(mock_socket)
+
+# 4. App Initialization
+app = FastAPI(lifespan=lifespan)
+
+# 5. Routes
+
+
+class UserInput(BaseModel):
+    text: str
+    user_id: str = "default_user"
+
+
+@app.post("/api/chat")
+async def handle_text_chat(input: UserInput):
+    """
+    Direct text input endpoint. 
+    Bypasses voice streaming, hits the orchestrator directly.
+    """
+    try:
+        
+        # We access the orchestrator directly from the app state
+        orchestrator = app.state.system.orchestrator
+        
+        payload = {
+            "messages": [HumanMessage(content=input.text)],
+            "transaction_context": {"property_id": None}
+        }
+
+        config = {"configurable": {"thread_id": input.user_id}}
+        
+        # Call your orchestrator's processing method
+        response = await orchestrator.graph.ainvoke(payload, config=config)
+        
+        return {"response": response}
+    except Exception as e:
+        logger.error(f"Error in text chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    
+@app.websocket("/ws/voice")
+async def voice_endpoint(websocket: WebSocket):
+    """
+    Entry point for real-time voice streaming.
+    """
+    await websocket.accept()
+    adapter = FastAPIWebSocketAdapter(websocket)
+    
+    try:
+        # Inject the adapter into the existing voice pipeline
+        await app.state.system.voice_handler.handle_voice_session(adapter)
+    except WebSocketDisconnect:
+        logger.info("Client connection closed.")
+    except Exception as e:
+        logger.error(f"Voice session error: {e}")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import uvicorn
+    # Start the server
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
