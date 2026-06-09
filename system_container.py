@@ -22,7 +22,7 @@ class HousePadiSystem:
         
         self.registry = HousePadiAgentRegistry()
         self.registry.initialize_production_agents()
-        llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.0)
+        llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.1, max_tokens=1024)
         
         # Inject the db_pool here
         self.orchestrator = PadiGraphOrchestrator(

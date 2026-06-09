@@ -74,28 +74,34 @@ class UserInput(BaseModel):
 async def handle_text_chat(input: UserInput):
     """
     Direct text input endpoint. 
-    Bypasses voice streaming, hits the orchestrator directly.
+    Returns the text content of the final message.
     """
     try:
-        
-        # We access the orchestrator directly from the app state
         orchestrator = app.state.system.orchestrator
-        
         payload = {
             "messages": [HumanMessage(content=input.text)],
             "transaction_context": {"property_id": None}
         }
-
         config = {"configurable": {"thread_id": input.user_id}}
         
-        # Call your orchestrator's processing method
-        response = await orchestrator.graph.ainvoke(payload, config=config)
+        # 1. Invoke the graph
+        result = await orchestrator.graph.ainvoke(payload, config=config)
         
-        return {"response": response}
+        # 2. Extract the last message content safely
+        messages = result.get("messages", [])
+        if messages:
+            final_message = messages[-1]
+            # If it's a LangChain message object, access .content
+            content = getattr(final_message, "content", str(final_message))
+        else:
+            content = "I'm sorry, I couldn't generate a response."
+            
+        return {"response": content}
+        
     except Exception as e:
-        logger.error(f"Error in text chat: {e}")
+        # Log the full traceback to identify where '__end__' is coming from
+        logger.exception("Error in text chat")
         raise HTTPException(status_code=500, detail=str(e))
-
     
 @app.websocket("/ws/voice")
 async def voice_endpoint(websocket: WebSocket):

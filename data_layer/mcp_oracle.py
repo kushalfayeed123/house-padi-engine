@@ -10,7 +10,6 @@ class OracleMCPServer:
     def __init__(self, supabase_client: Client, embedding_model):
         self.client = supabase_client
         self.model = embedding_model
-        self.search_tool = mcp_discovery.create_search_tool(self.model, self.client)
         mcp_transaction.set_client(supabase_client)
         
         # Complete inventory of all available tools
