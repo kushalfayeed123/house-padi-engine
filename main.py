@@ -1,6 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
@@ -67,22 +67,23 @@ app = FastAPI(lifespan=lifespan)
 
 class UserInput(BaseModel):
     text: str
-    user_id: str = "default_user"
+    session_id:str = "default_session"
 
 
 @app.post("/api/chat")
-async def handle_text_chat(input: UserInput):
+async def handle_text_chat(input: UserInput, request: Request):
     """
     Direct text input endpoint. 
     Returns the text content of the final message.
     """
     try:
+        user_id = request.headers.get("X-User-ID")
         orchestrator = app.state.system.orchestrator
         payload = {
             "messages": [HumanMessage(content=input.text)],
-            "transaction_context": {"property_id": None}
+            "transaction_context": {"current_user_id": user_id}
         }
-        config = {"configurable": {"thread_id": input.user_id}}
+        config = {"configurable": {"thread_id": input.session_id}}
         
         # 1. Invoke the graph
         result = await orchestrator.graph.ainvoke(payload, config=config)

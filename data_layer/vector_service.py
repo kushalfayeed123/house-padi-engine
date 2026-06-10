@@ -12,11 +12,11 @@ def get_model():
     return _model
 
 
-def vectorize_property_data(address: str, location: str, specs: Dict[str, Any]) -> list[float]:
+def vectorize_property_data(address: str, ownerId:str, location: str, specs: Dict[str, Any]) -> list[float]:
     """
     Creates a semantic string from property data and returns the embedding.
     """
     # Create a dense text representation of the property for better search results
-    context_string = f"Address: {address}. Location: {location}. Features: {str(specs)}"    
+    context_string = f"Address: {address}. Location: {location}. Features: {str(specs)} Owner ID: {ownerId}"    
     embedding = get_model().encode(context_string)
     return embedding.tolist()

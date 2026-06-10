@@ -79,6 +79,7 @@ class HousePadiAgentRegistry:
         )
         discovery_prompts = self.prompts.get("discovery", {})
         broker_prompts = self.prompts.get("broker", {})
+        identity_prompts = self.prompts.get("identity", {})
         
         # 1. Discovery
         self.register_agent(AgentManifest(
@@ -107,6 +108,23 @@ class HousePadiAgentRegistry:
             ]
         ))
         
+        # 3. Identity Manager
+        self.register_agent(AgentManifest(
+            name="identity",
+            description="Specializes in managing user profiles and settings.",
+            system_instructions=identity_prompts.get("system_instructions", ""),
+            authorized_mcp_tools=[
+                "get_user_profile", "update_user_profile"
+            ]
+        ))
+        
+        # 4. Tour Agent
+        self.register_agent(AgentManifest(
+            name="tour",
+            description="Handles tour scheduling, updates, and confirmations.",
+            system_instructions=self.prompts.get("tour", {}).get("system_instructions", ""),
+            authorized_mcp_tools=["schedule_tour", "get_tour_details", "update_tour", "search_semantic_listings"]
+        ))
 
     def is_valid_agent(self, name: str) -> bool:
         return name in self._registry

@@ -21,7 +21,6 @@ END $$;
 -- 3. Core Property Entity
 create table if not exists public.properties (
     id uuid default gen_random_uuid() primary key,
-    internal_code text unique not null,
     address text not null,
     status property_status default 'available',
     base_price numeric(15, 2) not null,

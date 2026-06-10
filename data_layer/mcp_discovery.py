@@ -20,11 +20,12 @@ class SearchInput(BaseModel):
 
 
 def create_search_tool(model, client):
+
     @tool(args_schema=SearchInput)
     def search_semantic_listings(
-        query: str, 
-        max_budget: Optional[float] = None, 
-        filters: Optional[Dict[str, Any]] = None
+        query: str,
+        max_budget: Optional[float]=None,
+        filters: Optional[Dict[str, Any]]=None
     ) -> str:
         """
         Scans real estate catalogs using natural language and optional feature filters.
