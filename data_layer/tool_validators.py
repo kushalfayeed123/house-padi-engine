@@ -6,7 +6,9 @@ def validate_add_property(args: Dict[str, Any], history: Any) -> Optional[str]:
     """
     Returns an error string if validation fails, otherwise returns None.
     """
-    # 1. Check for Missing Fields
+    # 1. Check for Missing 
+    if "user_id" in args and args.get("user_id") is not None:
+        return "Internal Error: Agent attempted to handle restricted identifiers."
     required = ["address", "location", "base_price", "specs", "owner_id"]
     missing = [f for f in required if not args.get(f)]
     if missing:
@@ -54,37 +56,24 @@ def validate_search(args: Dict[str, Any], history: Any) -> Optional[str]:
 
 
 def validate_schedule_tour(args: Dict[str, Any], history: Any) -> Optional[str]:
-    # 1. Check for basic presence
-    # if not args.get("property_id"):
-    #     return "I need to know which property you want to tour."
+    """Validate tour scheduling."""
+    if not args.get("property_id"):
+        return "I need to know which property you want to tour."
     
     tour_date_raw = args.get("tour_date")
     if not tour_date_raw:
-        return "Please specify the date and time for the tour (e.g., '2026-06-15 at 2:00 PM')."
+        return "Please specify the date and time for the tour (e.g., 'June 15 at 2:00 PM')."
 
-    # 2. Attempt to parse the date/time string
-    try:
-        # fuzzy=False ensures we don't accidentally parse junk
-        dt = parser.parse(tour_date_raw, fuzzy=False)
-        
-        # 3. Validation Logic: Check if it's in the future
-        # (Optional but highly recommended)
-        from datetime import datetime
-        if dt < datetime.now():
-            return f"The date '{tour_date_raw}' is in the past. Please provide a future date."
-
-        # 4. Check if Time was provided
-        # By default, dateutil sets missing time to 00:00:00.
-        # If the input doesn't explicitly look like it contains time info, prompt for it.
-        # We check if the input string contains common time indicators.
-        time_indicators = ["am", "pm", ":", "o'clock", "noon", "morning", "evening"]
-        if not any(indicator in str(tour_date_raw).lower() for indicator in time_indicators):
-            return "Please include the specific time of day for the tour (e.g., '10:00 AM')."
-
-    except (ValueError, OverflowError, TypeError):
-        return f"I couldn't understand the date '{tour_date_raw}'. Please use a format like 'YYYY-MM-DD HH:MM'."
-        
+    # Check that either renter_id is provided OR both visitor_name and visitor_contact are provided
+    renter_id = args.get("renter_id")
+    visitor_name = args.get("visitor_name")
+    visitor_contact = args.get("visitor_contact")
+    
+    if not renter_id and (not visitor_name or not visitor_contact):
+        return "I need either your renter ID or your name and contact information to schedule the tour."
+    
     return None
+
 
 
     # The Registry
@@ -92,5 +81,82 @@ TOOL_VALIDATORS = {
     "add_new_property_record": validate_add_property,
     "search_semantic_listings": validate_search,
     "schedule_tour": validate_schedule_tour
-
 }
+
+
+def validate_apply_for_property(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate application submission."""
+    if not args.get("property_id"):
+        return "I need to know which property you're applying for."
+    if not args.get("renter_id"):
+        return "Your user ID is required. Please log in."
+    if not args.get("application_data"):
+        return "Please provide information about yourself (employment, references, etc.)."
+    return None
+
+
+def validate_view_applications(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate landlord viewing applications."""
+    if not args.get("property_id"):
+        return "I need to know which property's applications you want to view."
+    return None
+
+
+def validate_approve_application(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate application approval."""
+    if not args.get("application_id"):
+        return "I need the application ID to approve."
+    if not args.get("landlord_id"):
+        return "Your user ID is required to approve applications."
+    return None
+
+
+def validate_deny_application(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate application denial."""
+    if not args.get("application_id"):
+        return "I need the application ID to deny."
+    if not args.get("landlord_id"):
+        return "Your user ID is required to deny applications."
+    return None
+
+
+def validate_create_lease(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate lease creation."""
+    if not args.get("property_id"):
+        return "I need the property ID for the lease."
+    if not args.get("renter_id"):
+        return "I need the renter's user ID."
+    if not args.get("landlord_id"):
+        return "I need the landlord's user ID."
+    if not args.get("lease_terms"):
+        return "I need lease terms (duration, rent amount, move-in date, etc.)."
+    return None
+
+
+def validate_sign_lease(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate lease signing."""
+    if not args.get("lease_id"):
+        return "I need the lease ID to sign."
+    if not args.get("signer_id"):
+        return "Your user ID is required to sign the lease."
+    return None
+
+
+def validate_terminate_lease(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate lease termination."""
+    if not args.get("lease_id"):
+        return "I need the lease ID to terminate."
+    return None
+
+
+# Update the registry with new validators
+TOOL_VALIDATORS.update({
+    "apply_for_property": validate_apply_for_property,
+    "view_applications": validate_view_applications,
+    "approve_application": validate_approve_application,
+    "deny_application": validate_deny_application,
+    "create_lease": validate_create_lease,
+    "sign_lease": validate_sign_lease,
+    "terminate_lease": validate_terminate_lease
+})
+

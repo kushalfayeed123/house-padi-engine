@@ -2,7 +2,7 @@
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
 from supabase import Client
-from data_layer import mcp_property, mcp_discovery, mcp_tour, mcp_user
+from data_layer import mcp_property, mcp_discovery, mcp_tour, mcp_user, mcp_application, mcp_lease
 
 
 class OracleMCPServer:
@@ -13,6 +13,8 @@ class OracleMCPServer:
         mcp_property.set_client(supabase_client)
         mcp_user.set_client(supabase_client)
         mcp_tour.set_client(supabase_client)
+        mcp_application.set_client(supabase_client)
+        mcp_lease.set_client(supabase_client)
         
         # Complete inventory of all available tools
         self._tool_map = {
@@ -25,7 +27,23 @@ class OracleMCPServer:
             "update_user_profile": mcp_user.update_user_profile,
             "schedule_tour": mcp_tour.schedule_tour,
             "get_tour_details": mcp_tour.get_tour_details,
-            "update_tour": mcp_tour.update_tour
+            "update_tour": mcp_tour.update_tour,
+            "view_tour_requests": mcp_tour.view_tour_requests,
+            "approve_tour_request": mcp_tour.approve_tour_request,
+            "deny_tour_request": mcp_tour.deny_tour_request,
+            "reschedule_tour": mcp_tour.reschedule_tour,
+            "get_renter_tour_requests": mcp_tour.get_renter_tour_requests,
+            "apply_for_property": mcp_application.apply_for_property,
+            "view_applications": mcp_application.view_applications,
+            "view_application_details": mcp_application.view_application_details,
+            "approve_application": mcp_application.approve_application,
+            "deny_application": mcp_application.deny_application,
+            "get_renter_applications": mcp_application.get_renter_applications,
+            "create_lease": mcp_lease.create_lease,
+            "sign_lease": mcp_lease.sign_lease,
+            "get_lease_details": mcp_lease.get_lease_details,
+            "get_active_leases": mcp_lease.get_active_leases,
+            "terminate_lease": mcp_lease.terminate_lease
         }
 
     def get_all_tools(self) -> List[Any]:

@@ -4,11 +4,11 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class AddPropertyInput(BaseModel):
-    address: str
-    location: str
-    base_price: float
-    specs: Dict[str, Any] = Field(..., description="Details like bedrooms, bathrooms, and amenities.")
-    owner_id: str
+    address: str = Field(description="The full address of the property")
+    location: str = Field(description="The city, state, or district")
+    base_price: float = Field(description="The base price of the property")
+    specs: Dict[str, Any] = Field(description="Property specifications (bedrooms, bathrooms, etc.)")
+    owner_id: Optional[str] = Field(default=None, description="System will auto-inject this. Leave blank.")
 
     @field_validator("specs")
     @classmethod

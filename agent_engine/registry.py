@@ -84,7 +84,7 @@ class HousePadiAgentRegistry:
         # 1. Discovery
         self.register_agent(AgentManifest(
             name="discovery",
-            description="Specializes in semantic property search.",
+            description="Specializes in semantically searching for existing listings.",
             system_instructions=discovery_prompts.get("system_instructions", ""),
             authorized_mcp_tools=["search_semantic_listings"]
         ))
@@ -100,12 +100,9 @@ class HousePadiAgentRegistry:
         # 3. Manager
         self.register_agent(AgentManifest(
             name="manager",
-            description="Specializes in maintenance, inspections, and lease management.",
+            description="Specializes in Property management tasks like updates, status changes, and maintenance scheduling.",
             system_instructions=manager_prompts,
-            authorized_mcp_tools=[
-                "log_maintenance", "get_property_ledger", "create_inspection",
-                "update_property", "fetch_property_by_uuid"
-            ]
+            authorized_mcp_tools=["update_property", "fetch_property_by_uuid", "delete_property"]
         ))
         
         # 3. Identity Manager
@@ -113,9 +110,7 @@ class HousePadiAgentRegistry:
             name="identity",
             description="Specializes in managing user profiles and settings.",
             system_instructions=identity_prompts.get("system_instructions", ""),
-            authorized_mcp_tools=[
-                "get_user_profile", "update_user_profile"
-            ]
+            authorized_mcp_tools=["get_user_profile", "update_user_profile", ]
         ))
         
         # 4. Tour Agent
@@ -124,6 +119,51 @@ class HousePadiAgentRegistry:
             description="Handles tour scheduling, updates, and confirmations.",
             system_instructions=self.prompts.get("tour", {}).get("system_instructions", ""),
             authorized_mcp_tools=["schedule_tour", "get_tour_details", "update_tour", "search_semantic_listings"]
+        ))
+
+        # 5. Renter Agent
+        self.register_agent(AgentManifest(
+            name="renter",
+            description="Helps renters find properties, book tours, apply for leases, and manage lease agreements.",
+            system_instructions=self.prompts.get("renter", {}).get("system_instructions", ""),
+            authorized_mcp_tools=[
+                "search_semantic_listings",
+                "fetch_property_by_uuid",
+                "schedule_tour",
+                "get_renter_tour_requests",
+                "apply_for_property",
+                "get_renter_applications",
+                "sign_lease",
+                "get_lease_details",
+                "get_active_leases",
+                "get_user_profile",
+                "update_user_profile"
+            ]
+        ))
+
+        # 6. Landlord Agent
+        self.register_agent(AgentManifest(
+            name="landlord",
+            description="Helps landlords manage properties, view tour requests, review applications, and manage leases.",
+            system_instructions=self.prompts.get("landlord", {}).get("system_instructions", ""),
+            authorized_mcp_tools=[
+                "fetch_property_by_uuid",
+                "view_tour_requests",
+                "approve_tour_request",
+                "deny_tour_request",
+                "reschedule_tour",
+                "view_applications",
+                "view_application_details",
+                "approve_application",
+                "deny_application",
+                "create_lease",
+                "sign_lease",
+                "get_lease_details",
+                "get_active_leases",
+                "terminate_lease",
+                "get_user_profile",
+                "update_user_profile"
+            ]
         ))
 
     def is_valid_agent(self, name: str) -> bool:
