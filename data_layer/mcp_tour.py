@@ -10,9 +10,11 @@ logger = logging.getLogger(__name__)
 
 _supabase_client: Optional[Client] = None
 
+
 def set_client(client: Client) -> None:
     global _supabase_client
     _supabase_client = client
+
 
 def _get_client() -> Client:
     if _supabase_client is None:
@@ -23,24 +25,33 @@ def _get_client() -> Client:
 class GetTourDetailsSchema(BaseModel):
     tour_id: str
 
+
 @tool
 def schedule_tour(
-    property_id: str, 
+    property_id: str,
     tour_date: str,
-    renter_id: Optional[str] = None,
-    visitor_name: Optional[str] = None,
-    visitor_contact: Optional[str] = None
+    renter_id: Optional[str]=None,
+    visitor_name: Optional[str]=None,
+    visitor_contact: Optional[str]=None
 ) -> Dict[str, Any]:
-    """Schedules a new property tour. tour_date format: YYYY-MM-DDTHH:MM:SS or natural language like '2026-06-15 at 2:00 PM'"""
+    """Schedules a new property tour. tour_date format: YYYY-MM-DDTHH:MM:SS or natural language like '2026-06-15 at 2:00 PM'
+     IMPORTANT: tour_date is REQUIRED and must be explicitly provided by the user.
+    Format: YYYY-MM-DDTHH:MM:SS (e.g., '2026-06-20T14:00:00').
+    Do NOT call this tool until the user has confirmed both a date AND a time.
+    If either is missing, ask the user before proceeding.
+    """
     client = _get_client()
     try:
+        if not tour_date or tour_date.strip().lower() in ("", "none", "tbd", "unknown"):
+            return {"status": "ERROR", "message": "Tour date and time are required. Please ask the user to provide a specific date and time."}
+
         # If renter_id is provided, fetch user details from profile
         if renter_id:
             user_response = client.table("profiles").select("*").eq("id", renter_id).maybe_single().execute()
             if user_response is not None and user_response.data:
                 user_data = cast(Dict[str, Any], user_response.data)
-                visitor_name = user_data.get("name", "Unknown Visitor")
-                visitor_contact = user_data.get("email") or user_data.get("phone", "N/A")
+                visitor_name = user_data.get("full_name")
+                visitor_contact = user_data.get("phone")
             else:
                 return {"status": "ERROR", "message": "Renter profile not found."}
         
@@ -66,6 +77,7 @@ def schedule_tour(
         logger.error(f"Schedule tour error: {e}")
         return {"status": "ERROR", "message": str(e)}
 
+
 @tool(args_schema=GetTourDetailsSchema)
 def get_tour_details(tour_id: str) -> str:
     """Fetches details of a specific tour by ID."""
@@ -80,6 +92,7 @@ def get_tour_details(tour_id: str) -> str:
         return json.dumps({"status": "SUCCESS", "data": response.data})
     except Exception as e:
         return json.dumps({"status": "ERROR", "message": str(e)})
+
 
 @tool
 def update_tour(tour_id: str, status: str) -> str:
@@ -120,7 +133,7 @@ def approve_tour_request(tour_id: str) -> Dict[str, Any]:
 
 
 @tool
-def deny_tour_request(tour_id: str, reason: str = "") -> Dict[str, Any]:
+def deny_tour_request(tour_id: str, reason: str="") -> Dict[str, Any]:
     """Landlord denies a tour request."""
     client = _get_client()
     try:

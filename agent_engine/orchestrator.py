@@ -1,3 +1,4 @@
+
 import logging
 from typing import Annotated, TypedDict, List, Dict, Any, Optional
 from langgraph.graph import StateGraph, START, END
@@ -9,9 +10,14 @@ from pydantic import BaseModel, Field, create_model
 from agent_engine.registry import HousePadiAgentRegistry
 from data_layer.mcp_oracle import OracleMCPServer
 from data_layer.tool_validators import TOOL_VALIDATORS
+from data_layer.permissions import check_permission
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
@@ -28,9 +34,53 @@ class PlanStep(BaseModel):
     args: Dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool call.")
 
 
+# ---------------------------------------------------------------------------
+# Auto-injection map
+# Defines which tools need which field silently injected from transaction_context.
+# Format:  tool_name → { arg_name: context_key }
+# ---------------------------------------------------------------------------
+
+AUTO_INJECT: Dict[str, Dict[str, str]] = {
+    # Property
+    "add_new_property_record": {"owner_id": "current_user_id"},
+
+    # Tour
+    "schedule_tour":           {"renter_id": "current_user_id"},
+
+    # Applications
+    "apply_for_property":      {"renter_id": "current_user_id"},
+    "get_renter_applications": {"renter_id": "current_user_id"},
+    "approve_application":     {"landlord_id": "current_user_id"},
+    "deny_application":        {"landlord_id": "current_user_id"},
+
+    # Leases
+    "sign_lease":              {"signer_id": "current_user_id"},
+    "get_active_leases":       {"user_id": "current_user_id"},
+
+    # User profile
+    "get_user_profile":        {"user_id": "current_user_id"},
+    "update_user_profile":     {"user_id": "current_user_id"},
+}
+
+# Fields the LLM should never be allowed to supply (always system-injected)
+PROTECTED_ARGS: Dict[str, set] = {
+    tool: set(mapping.keys()) for tool, mapping in AUTO_INJECT.items()
+}
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
 class MultiAgentOrchestrator:
 
-    def __init__(self, registry: HousePadiAgentRegistry, llm_client: Any, oracle: OracleMCPServer, db_url: str):
+    def __init__(
+        self,
+        registry: HousePadiAgentRegistry,
+        llm_client: Any,
+        oracle: OracleMCPServer,
+        db_url: str,
+    ):
         self.registry = registry
         self.llm = llm_client
         self.oracle = oracle
@@ -39,6 +89,10 @@ class MultiAgentOrchestrator:
         builder = self._build_workflow_graph()
         memory = MemorySaver()
         self.graph = builder.compile(checkpointer=memory)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _get_router_schema(self, agent_names: List[str]):
         return create_model(
@@ -57,6 +111,59 @@ class MultiAgentOrchestrator:
         entries = memory.get(active_agent, [])[-5:]
         return "\n".join([f"MEMORY: {entry}" for entry in entries])
 
+    def _merge_transaction_context(
+        self,
+        state: AgentState,
+        incoming: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Fix 3 — Merges incoming context (from the HTTP request) with the
+        context already persisted in the checkpoint so that user_id and
+        user_role are never lost across graph turns.
+        """
+        existing = dict(state.get("transaction_context") or {})
+        # Incoming values win for top-level identity keys so a fresh
+        # request can always reassert who the caller is.
+        for key in ("current_user_id", "user_role"):
+            if incoming.get(key) is not None:
+                existing[key] = incoming[key]
+        # Merge any other keys the caller passed without wiping agent_memory
+        for k, v in incoming.items():
+            if k not in existing:
+                existing[k] = v
+        return existing
+
+    def _update_agent_memory(
+        self,
+        state: AgentState,
+        agent_name: str,
+        message: BaseMessage,
+    ) -> Dict[str, Any]:
+        transaction_context = dict(state.get("transaction_context", {}))
+        memory = dict(transaction_context.get("agent_memory", {}))
+        entry = getattr(message, "content", None)
+        if entry:
+            agent_history = list(memory.get(agent_name, []))
+            agent_history.append(entry)
+            memory[agent_name] = agent_history[-20:]
+            transaction_context["agent_memory"] = memory
+        return transaction_context
+
+    def _format_plan_instructions(self, plan: Optional[List[Dict[str, Any]]]) -> str:
+        if not plan:
+            return "The agent may proceed with a single-step response."
+        lines = []
+        for step in plan:
+            lines.append(
+                f"{step.get('step_id')}. {step.get('description')}"
+                + (f" Use tool: {step.get('tool_name')}" if step.get("tool_name") else "")
+            )
+        return "PLANNED STEPS:\n" + "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Nodes
+    # ------------------------------------------------------------------
+
     def router_node(self, state: AgentState):
         manifests = self.registry.get_all_manifests()
         agent_names = [m.name for m in manifests]
@@ -73,7 +180,8 @@ class MultiAgentOrchestrator:
         system_instructions = (
             "You are the House Padi Orchestrator. Decide which registered agent should handle the user's latest request.\n"
             f"Available agents:\n{agent_descriptions}\n"
-            "- 'end': Use this if the user is done or the request has been fully satisfied." + context_instruction
+            "- 'end': Use this if the user is done or the request has been fully satisfied."
+            + context_instruction
         )
 
         if memory_text:
@@ -108,29 +216,7 @@ class MultiAgentOrchestrator:
 
         messages = [SystemMessage(content=system_instructions)] + state["messages"]
         decision = self.llm.with_structured_output(plan_schema).invoke(messages)
-
         return {"agent_plan": [step.model_dump() for step in decision.steps]}
-
-    def _format_plan_instructions(self, plan: Optional[List[Dict[str, Any]]]) -> str:
-        if not plan:
-            return "The agent may proceed with a single-step response."
-
-        lines = []
-        for step in plan:
-            lines.append(f"{step.get('step_id')}. {step.get('description')}" +
-                         (f" Use tool: {step.get('tool_name')}" if step.get('tool_name') else ""))
-        return "PLANNED STEPS:\n" + "\n".join(lines)
-
-    def _update_agent_memory(self, state: AgentState, agent_name: str, message: BaseMessage) -> Dict[str, Any]:
-        transaction_context = dict(state.get("transaction_context", {}))
-        memory = dict(transaction_context.get("agent_memory", {}))
-        entry = getattr(message, "content", None)
-        if entry:
-            agent_history = list(memory.get(agent_name, []))
-            agent_history.append(entry)
-            memory[agent_name] = agent_history[-20:]
-            transaction_context["agent_memory"] = memory
-        return transaction_context
 
     def _human_handoff_node(self, state: AgentState) -> dict:
         return {
@@ -148,11 +234,9 @@ class MultiAgentOrchestrator:
         messages = state["messages"]
         if len(messages) < 2:
             return "continue"
-
         last_msg = messages[-1]
         second_last_msg = messages[-2]
-
-        if (isinstance(second_last_msg, ToolMessage) and "no_results" in second_last_msg.content):
+        if isinstance(second_last_msg, ToolMessage) and "no_results" in second_last_msg.content:
             if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
                 return "stop_and_ask_user"
         return "continue"
@@ -168,23 +252,50 @@ class MultiAgentOrchestrator:
 
         if isinstance(last_msg, AIMessage) and isinstance(last_msg.content, str):
             if "function=" in last_msg.content:
-                return {"messages": [SystemMessage(content=(
-                    "CRITICAL VIOLATION: You attempted to write a function call in plain text. "
-                    "You must wait for the user to reply. DO NOT invent data and DO NOT search the web. "
-                    "Just ask your question and stop generating text."
-                ))]}
+                return {
+                    "messages": [
+                        SystemMessage(
+                            content=(
+                                "CRITICAL VIOLATION: You attempted to write a function call in plain text. "
+                                "You must wait for the user to reply. DO NOT invent data and DO NOT search the web. "
+                                "Just ask your question and stop generating text."
+                            )
+                        )
+                    ]
+                }
+
+        ctx = state.get("transaction_context", {})
 
         for tool_call in last_msg.tool_calls:
             tool_name = tool_call["name"]
             args = tool_call.get("args", {})
+
+            # --- schema validator (existing) ---
             validator = TOOL_VALIDATORS.get(tool_name)
             if validator:
                 error_message = validator(args, messages)
                 if error_message:
-                    return {"messages": [ToolMessage(
-                        tool_call_id=tool_call["id"],
-                        content=f"ERROR: {error_message}"
-                    )]}
+                    return {
+                        "messages": [
+                            ToolMessage(
+                                tool_call_id=tool_call["id"],
+                                content=f"ERROR: {error_message}",
+                            )
+                        ]
+                    }
+
+            # --- RBAC check ---
+            result = check_permission(tool_name, args, ctx)
+            if not result.allowed:
+                logger.warning(f"RBAC denied '{tool_name}' for role='{ctx.get('user_role')}': {result.reason}")
+                return {
+                    "messages": [
+                        ToolMessage(
+                            tool_call_id=tool_call["id"],
+                            content=f"PERMISSION_DENIED: {result.reason}",
+                        )
+                    ]
+                }
 
         return {}
 
@@ -193,7 +304,9 @@ class MultiAgentOrchestrator:
         last_msg = messages[-1]
         error_count = 0
         for msg in reversed(messages[-6:]):
-            if isinstance(msg, ToolMessage) and "ERROR:" in str(msg.content):
+            if isinstance(msg, ToolMessage) and (
+                "ERROR:" in str(msg.content) or "PERMISSION_DENIED:" in str(msg.content)
+            ):
                 error_count += 1
             elif isinstance(msg, SystemMessage) and "CRITICAL" in str(msg.content):
                 error_count += 1
@@ -201,7 +314,9 @@ class MultiAgentOrchestrator:
             logger.error("Circuit breaker triggered: Stopping infinite LLM loop.")
             return "human_handoff"
 
-        if isinstance(last_msg, ToolMessage) and "ERROR:" in last_msg.content:
+        if isinstance(last_msg, ToolMessage) and (
+            "ERROR:" in last_msg.content or "PERMISSION_DENIED:" in last_msg.content
+        ):
             return f"execute_{state['current_agent']}"
 
         if isinstance(last_msg, SystemMessage) and "CRITICAL" in str(last_msg.content):
@@ -219,7 +334,7 @@ class MultiAgentOrchestrator:
 
         last_msg = messages[-1]
         if isinstance(last_msg, ToolMessage):
-            if "ERROR:" in str(last_msg.content):
+            if "ERROR:" in str(last_msg.content) or "PERMISSION_DENIED:" in str(last_msg.content):
                 return "human_handoff"
             return "router"
 
@@ -231,55 +346,98 @@ class MultiAgentOrchestrator:
     def _execute_agent_node(self, agent_name: str):
 
         def node(state: AgentState) -> Dict[str, Any]:
+            
+            ctx = state.get("transaction_context", {})
+            user_id = ctx.get("current_user_id")
+            
+            # If no user_id AND agent is not 'discovery', block immediately.
+            if agent_name != "discovery" and not user_id:
+                logger.warning(f"Unauthenticated access attempt blocked for agent: {agent_name}")
+                return {
+                    "messages": [
+                        AIMessage(
+                            content="Authentication required. Please log in to access this feature."
+                        )
+                    ]
+                }
+                
             manifest = self.registry.resolve_agent(agent_name)
             all_tools = self.oracle.get_all_tools()
             authorized_tool_names = manifest.authorized_mcp_tools
+            ctx = state.get("transaction_context", {})
             system_msg = SystemMessage(
                 content=(
                     f"{manifest.system_instructions}\n\n"
                     f"AVAILABLE TOOLS: {', '.join(authorized_tool_names)}.\n"
                     f"{self._format_plan_instructions(state.get('agent_plan'))}\n"
-                    "STRICT RULE: Use only the tools listed above. Do not attempt any tool or API that is not explicitly authorized."
+                    "STRICT RULE: Use only the tools listed above. Do not attempt any tool or API that is not explicitly authorized.\n"
+                    "IDENTITY RULE: Never ask the user for their ID, role, or any system identifier. "
+                    "These are injected automatically by the platform."
                 )
             )
+
             allowed_tools = [t for t in all_tools if t.name in authorized_tool_names]
             llm_with_tools = self.llm.bind_tools(allowed_tools, tool_choice="auto")
-            user_id = state["transaction_context"].get("current_user_id")
 
             try:
                 response = llm_with_tools.invoke([system_msg] + state["messages"])
 
                 if response.tool_calls:
                     for tc in response.tool_calls:
-                        if tc["name"] == "add_new_property_record" and user_id is not None:
-                            tc["args"]["owner_id"] = user_id
-                            tc["args"].pop("user_id", None)
-                        tc["args"] = {k: v for k, v in tc["args"].items() if v is not None}
-                        if tc["name"] not in authorized_tool_names:
-                            return {"messages": [
-                                AIMessage(
-                                    content=(
-                                        f"ERROR: You are not authorized to use '{tc['name']}'. "
-                                        f"You may only use: {', '.join(authorized_tool_names)}."
+                        tool_name = tc["name"]
+
+                        # --- Fix 1, 2, 3: unified auto-injection via AUTO_INJECT map ---
+                        injections = AUTO_INJECT.get(tool_name, {})
+                        for arg_key, ctx_key in injections.items():
+                            value = ctx.get(ctx_key)
+                            if value is not None:
+                                tc["args"][arg_key] = value
+
+                        # Strip any protected arg the LLM hallucinated
+                        protected = PROTECTED_ARGS.get(tool_name, set())
+                        tc["args"] = {
+                            k: v for k, v in tc["args"].items()
+                            if v is not None and (k not in protected or k in injections)
+                        }
+
+                        if tool_name not in authorized_tool_names:
+                            return {
+                                "messages": [
+                                    AIMessage(
+                                        content=(
+                                            f"ERROR: You are not authorized to use '{tool_name}'. "
+                                            f"You may only use: {', '.join(authorized_tool_names)}."
+                                        )
                                     )
-                                )
-                            ]}
+                                ]
+                            }
 
                 new_context = self._update_agent_memory(state, agent_name, response)
-                return {"messages": [response], "current_agent": agent_name, "transaction_context": new_context}
+                return {
+                    "messages": [response],
+                    "current_agent": agent_name,
+                    "transaction_context": new_context,
+                }
+
             except Exception as e:
-                logger.error(f"Execution error: {e}")
+                logger.error(f"Execution error in agent '{agent_name}': {e}")
                 return {
                     "messages": [
-                        AIMessage(content=(
-                            "SYSTEM ERROR: The previous attempt to use a tool failed because the output "
-                            "was incorrectly formatted. You MUST use the provided tool-calling API. "
-                            "Do not output plain text descriptions of the tool. Call the tool directly."
-                        ))
+                        AIMessage(
+                            content=(
+                                "SYSTEM ERROR: The previous attempt to use a tool failed because the output "
+                                "was incorrectly formatted. You MUST use the provided tool-calling API. "
+                                "Do not output plain text descriptions of the tool. Call the tool directly."
+                            )
+                        )
                     ]
                 }
 
         return node
+
+    # ------------------------------------------------------------------
+    # Graph wiring
+    # ------------------------------------------------------------------
 
     def _build_workflow_graph(self) -> Any:
         workflow = StateGraph(AgentState)
@@ -300,7 +458,6 @@ class MultiAgentOrchestrator:
             return END if agent == "end" else "planner"
 
         workflow.add_conditional_edges("router", route_from_router)
-
         workflow.add_conditional_edges("planner", lambda state: f"execute_{state['current_agent']}")
 
         for manifest in self.registry.get_all_manifests():
@@ -331,7 +488,7 @@ class MultiAgentOrchestrator:
                     "human_handoff": "human_handoff",
                     "supervisor": "supervisor",
                     END: END,
-                }
+                },
             )
 
         workflow.add_edge("tools", "supervisor")

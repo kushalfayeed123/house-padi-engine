@@ -1,0 +1,3200 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.gitignore
+.python-version
+agent_engine/__init__.py
+agent_engine/graph.py
+agent_engine/orchestrator.py
+agent_engine/prompts.json
+agent_engine/registry.py
+agent_engine/utils.py
+data_layer/__init__.py
+data_layer/mcp_application.py
+data_layer/mcp_discovery.py
+data_layer/mcp_lease.py
+data_layer/mcp_oracle.py
+data_layer/mcp_property.py
+data_layer/mcp_tour.py
+data_layer/mcp_user.py
+data_layer/schemas/add_property_input.py
+data_layer/tool_validators.py
+data_layer/vector_service.py
+LEASING_FLOW.md
+main.py
+pyproject.toml
+README.md
+supabase/.gitignore
+supabase/config.toml
+supabase/migrations/20260607132816_update_properties_schema.sql
+supabase/migrations/20260608_add_applications_and_leases.sql
+system_container.py
+tests/__init__.py
+tests/search_test.py
+tests/test_system.py
+tests/test_voice_pipeline.py
+voice_engine/__init__.py
+voice_engine/stream_handler.py
+voice_engine/tts_client.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".gitignore">
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+</file>
+
+<file path=".python-version">
+3.12
+</file>
+
+<file path="agent_engine/__init__.py">
+
+</file>
+
+<file path="agent_engine/orchestrator.py">
+import logging
+from typing import Annotated, TypedDict, List, Dict, Any, Optional
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, ToolMessage
+from pydantic import BaseModel, Field, create_model
+from agent_engine.registry import HousePadiAgentRegistry
+from data_layer.mcp_oracle import OracleMCPServer
+from data_layer.tool_validators import TOOL_VALIDATORS
+
+logger = logging.getLogger(__name__)
+
+
+class AgentState(TypedDict):
+    messages: Annotated[List[BaseMessage], add_messages]
+    current_agent: Optional[str]
+    transaction_context: Dict[str, Any]
+    agent_plan: Optional[List[Dict[str, Any]]]
+    search_performed: bool
+
+
+class PlanStep(BaseModel):
+    step_id: int = Field(..., description="The ordered step number.")
+    description: str = Field(..., description="What this agent should do next.")
+    tool_name: Optional[str] = Field(None, description="The tool to use for this step.")
+    args: Dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool call.")
+
+
+class MultiAgentOrchestrator:
+
+    def __init__(self, registry: HousePadiAgentRegistry, llm_client: Any, oracle: OracleMCPServer, db_url: str):
+        self.registry = registry
+        self.llm = llm_client
+        self.oracle = oracle
+        self.db_url = db_url
+
+        builder = self._build_workflow_graph()
+        memory = MemorySaver()
+        self.graph = builder.compile(checkpointer=memory)
+
+    def _get_router_schema(self, agent_names: List[str]):
+        return create_model(
+            "RouterDecision",
+            next_agent=(str, Field(description="The agent best suited to handle the request.")),
+        )
+
+    def _render_agent_memory(self, state: AgentState) -> str:
+        active_agent = state.get("current_agent")
+        transaction_context = state.get("transaction_context", {})
+        if not isinstance(transaction_context, dict):
+            transaction_context = {}
+        memory = transaction_context.get("agent_memory", {})
+        if not active_agent or not memory.get(active_agent):
+            return ""
+        entries = memory.get(active_agent, [])[-5:]
+        return "\n".join([f"MEMORY: {entry}" for entry in entries])
+
+    def router_node(self, state: AgentState):
+        manifests = self.registry.get_all_manifests()
+        agent_names = [m.name for m in manifests]
+        active_agent = state.get("current_agent")
+
+        agent_descriptions = "\n".join([f"- '{m.name}': {m.description}" for m in manifests])
+        memory_text = self._render_agent_memory(state)
+
+        context_instruction = (
+            f"\n\nCURRENT CONTEXT: The conversation is currently assigned to '{active_agent}'.\n"
+            "Only stay on that agent unless the user explicitly changes the topic or asks for a different service."
+        ) if active_agent else "\n\nNo agent is currently active."
+
+        system_instructions = (
+            "You are the House Padi Orchestrator. Decide which registered agent should handle the user's latest request.\n"
+            f"Available agents:\n{agent_descriptions}\n"
+            "- 'end': Use this if the user is done or the request has been fully satisfied." + context_instruction
+        )
+
+        if memory_text:
+            system_instructions += "\n\n" + memory_text
+
+        dynamic_schema = self._get_router_schema(agent_names + ["end"])
+        messages = [SystemMessage(content=system_instructions)] + state["messages"]
+        decision = self.llm.with_structured_output(dynamic_schema).invoke(messages)
+
+        logger.info(f"Routing decision: {decision.next_agent}")
+        return {"current_agent": decision.next_agent}
+
+    def _plan_node(self, state: AgentState) -> Dict[str, Any]:
+        agent_name = state.get("current_agent")
+        if not agent_name:
+            return {"agent_plan": []}
+
+        manifest = self.registry.resolve_agent(agent_name)
+        allowed_tools = ", ".join(manifest.authorized_mcp_tools) or "none"
+
+        system_instructions = (
+            f"You are the planning agent for '{agent_name}'.\n"
+            f"Create an ordered execution plan for the user request using only the tools listed: {allowed_tools}.\n"
+            "If no tool call is required, create a single descriptive step explaining the response.\n"
+            "Output a JSON array of ordered steps with 'step_id', 'description', 'tool_name', and 'args'."
+        )
+
+        plan_schema = create_model(
+            "AgentPlan",
+            steps=(List[PlanStep], Field(description="A sequential execution plan for the chosen agent.")),
+        )
+
+        messages = [SystemMessage(content=system_instructions)] + state["messages"]
+        decision = self.llm.with_structured_output(plan_schema).invoke(messages)
+
+        return {"agent_plan": [step.model_dump() for step in decision.steps]}
+
+    def _format_plan_instructions(self, plan: Optional[List[Dict[str, Any]]]) -> str:
+        if not plan:
+            return "The agent may proceed with a single-step response."
+
+        lines = []
+        for step in plan:
+            lines.append(f"{step.get('step_id')}. {step.get('description')}" +
+                         (f" Use tool: {step.get('tool_name')}" if step.get('tool_name') else ""))
+        return "PLANNED STEPS:\n" + "\n".join(lines)
+
+    def _update_agent_memory(self, state: AgentState, agent_name: str, message: BaseMessage) -> Dict[str, Any]:
+        transaction_context = dict(state.get("transaction_context", {}))
+        memory = dict(transaction_context.get("agent_memory", {}))
+        entry = getattr(message, "content", None)
+        if entry:
+            agent_history = list(memory.get(agent_name, []))
+            agent_history.append(entry)
+            memory[agent_name] = agent_history[-20:]
+            transaction_context["agent_memory"] = memory
+        return transaction_context
+
+    def _human_handoff_node(self, state: AgentState) -> dict:
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "I have reached a point where I need your guidance to proceed. "
+                        "Could you please adjust your request, clarify the details, or provide additional context?"
+                    )
+                )
+            ]
+        }
+
+    def _check_search_loop(self, state: AgentState) -> str:
+        messages = state["messages"]
+        if len(messages) < 2:
+            return "continue"
+
+        last_msg = messages[-1]
+        second_last_msg = messages[-2]
+
+        if (isinstance(second_last_msg, ToolMessage) and "no_results" in second_last_msg.content):
+            if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+                return "stop_and_ask_user"
+        return "continue"
+
+    def _validate_tool_calls(self, state: AgentState) -> Dict[str, Any]:
+        messages = state.get("messages", [])
+        if not messages:
+            return {}
+
+        last_msg = messages[-1]
+        if not (isinstance(last_msg, AIMessage) and last_msg.tool_calls):
+            return {}
+
+        if isinstance(last_msg, AIMessage) and isinstance(last_msg.content, str):
+            if "function=" in last_msg.content:
+                return {"messages": [SystemMessage(content=(
+                    "CRITICAL VIOLATION: You attempted to write a function call in plain text. "
+                    "You must wait for the user to reply. DO NOT invent data and DO NOT search the web. "
+                    "Just ask your question and stop generating text."
+                ))]}
+
+        for tool_call in last_msg.tool_calls:
+            tool_name = tool_call["name"]
+            args = tool_call.get("args", {})
+            validator = TOOL_VALIDATORS.get(tool_name)
+            if validator:
+                error_message = validator(args, messages)
+                if error_message:
+                    return {"messages": [ToolMessage(
+                        tool_call_id=tool_call["id"],
+                        content=f"ERROR: {error_message}"
+                    )]}
+
+        return {}
+
+    def _route_after_validation(self, state: AgentState) -> str:
+        messages = state["messages"]
+        last_msg = messages[-1]
+        error_count = 0
+        for msg in reversed(messages[-6:]):
+            if isinstance(msg, ToolMessage) and "ERROR:" in str(msg.content):
+                error_count += 1
+            elif isinstance(msg, SystemMessage) and "CRITICAL" in str(msg.content):
+                error_count += 1
+        if error_count >= 2:
+            logger.error("Circuit breaker triggered: Stopping infinite LLM loop.")
+            return "human_handoff"
+
+        if isinstance(last_msg, ToolMessage) and "ERROR:" in last_msg.content:
+            return f"execute_{state['current_agent']}"
+
+        if isinstance(last_msg, SystemMessage) and "CRITICAL" in str(last_msg.content):
+            return f"execute_{state['current_agent']}"
+
+        return "tools"
+
+    def _supervisor_node(self, state: AgentState) -> Dict[str, Any]:
+        return {}
+
+    def _supervisor_route(self, state: AgentState) -> str:
+        messages = state["messages"]
+        if not messages:
+            return END
+
+        last_msg = messages[-1]
+        if isinstance(last_msg, ToolMessage):
+            if "ERROR:" in str(last_msg.content):
+                return "human_handoff"
+            return "router"
+
+        if isinstance(last_msg, SystemMessage) and "CRITICAL" in str(last_msg.content):
+            return "human_handoff"
+
+        return END
+
+    def _execute_agent_node(self, agent_name: str):
+
+        def node(state: AgentState) -> Dict[str, Any]:
+            manifest = self.registry.resolve_agent(agent_name)
+            all_tools = self.oracle.get_all_tools()
+            authorized_tool_names = manifest.authorized_mcp_tools
+            system_msg = SystemMessage(
+                content=(
+                    f"{manifest.system_instructions}\n\n"
+                    f"AVAILABLE TOOLS: {', '.join(authorized_tool_names)}.\n"
+                    f"{self._format_plan_instructions(state.get('agent_plan'))}\n"
+                    "STRICT RULE: Use only the tools listed above. Do not attempt any tool or API that is not explicitly authorized."
+                )
+            )
+            allowed_tools = [t for t in all_tools if t.name in authorized_tool_names]
+            llm_with_tools = self.llm.bind_tools(allowed_tools, tool_choice="auto")
+            user_id = state["transaction_context"].get("current_user_id")
+
+            try:
+                response = llm_with_tools.invoke([system_msg] + state["messages"])
+
+                if response.tool_calls:
+                    for tc in response.tool_calls:
+                        if tc["name"] == "add_new_property_record" and user_id is not None:
+                            tc["args"]["owner_id"] = user_id
+                            tc["args"].pop("user_id", None)
+                        if tc["name"] == "schedule_tour" and user_id is not None:
+                            tc["args"]["renter_id"] = user_id
+                        tc["args"] = {k: v for k, v in tc["args"].items() if v is not None}
+                        if tc["name"] not in authorized_tool_names:
+                            return {"messages": [
+                                AIMessage(
+                                    content=(
+                                        f"ERROR: You are not authorized to use '{tc['name']}'. "
+                                        f"You may only use: {', '.join(authorized_tool_names)}."
+                                    )
+                                )
+                            ]}
+
+                new_context = self._update_agent_memory(state, agent_name, response)
+                return {"messages": [response], "current_agent": agent_name, "transaction_context": new_context}
+            except Exception as e:
+                logger.error(f"Execution error: {e}")
+                return {
+                    "messages": [
+                        AIMessage(content=(
+                            "SYSTEM ERROR: The previous attempt to use a tool failed because the output "
+                            "was incorrectly formatted. You MUST use the provided tool-calling API. "
+                            "Do not output plain text descriptions of the tool. Call the tool directly."
+                        ))
+                    ]
+                }
+
+        return node
+
+    def _build_workflow_graph(self) -> Any:
+        workflow = StateGraph(AgentState)
+        workflow.add_node("router", self.router_node)
+        workflow.add_node("planner", self._plan_node)
+        workflow.add_node("validate_tools", self._validate_tool_calls)
+        workflow.add_node("tools", ToolNode(self.oracle.get_all_tools()))
+        workflow.add_node("supervisor", self._supervisor_node)
+        workflow.add_node("human_handoff", self._human_handoff_node)
+
+        for manifest in self.registry.get_all_manifests():
+            workflow.add_node(f"execute_{manifest.name}", self._execute_agent_node(manifest.name))
+
+        workflow.add_edge(START, "router")
+
+        def route_from_router(state: AgentState):
+            agent = state.get("current_agent")
+            return END if agent == "end" else "planner"
+
+        workflow.add_conditional_edges("router", route_from_router)
+
+        workflow.add_conditional_edges("planner", lambda state: f"execute_{state['current_agent']}")
+
+        for manifest in self.registry.get_all_manifests():
+            node_name = f"execute_{manifest.name}"
+
+            def create_agent_router(agent_name):
+                def route(state: AgentState):
+                    if agent_name == "discovery" and self._check_search_loop(state) == "stop_and_ask_user":
+                        return "human_handoff"
+
+                    messages = state["messages"]
+                    if messages:
+                        last_msg = messages[-1]
+                        if isinstance(last_msg, AIMessage) and hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                            return "validate_tools"
+                        if isinstance(last_msg, AIMessage) and isinstance(last_msg.content, str):
+                            if "function=" in last_msg.content or "tool_call" in last_msg.content:
+                                return "validate_tools"
+                    return "supervisor"
+
+                return route
+
+            workflow.add_conditional_edges(
+                node_name,
+                create_agent_router(manifest.name),
+                {
+                    "validate_tools": "validate_tools",
+                    "human_handoff": "human_handoff",
+                    "supervisor": "supervisor",
+                    END: END,
+                }
+            )
+
+        workflow.add_edge("tools", "supervisor")
+        workflow.add_conditional_edges("validate_tools", self._route_after_validation)
+        workflow.add_conditional_edges("supervisor", self._supervisor_route)
+
+        return workflow
+</file>
+
+<file path="agent_engine/utils.py">
+import json
+from pathlib import Path
+
+def load_agent_prompts(filename="prompts.json"):
+    path = Path(__file__).parent / filename
+    with open(path, "r") as f:
+        return json.load(f)
+</file>
+
+<file path="data_layer/__init__.py">
+
+</file>
+
+<file path="data_layer/mcp_application.py">
+import json
+import logging
+from typing import Dict, Any, List, Optional, cast
+import uuid
+from langchain_core.tools import tool
+from supabase import Client
+from datetime import datetime
+
+_supabase_client: Optional[Client] = None
+logger = logging.getLogger(__name__)
+
+
+def set_client(client: Client) -> None:
+    global _supabase_client
+    _supabase_client = client
+
+
+def _get_client() -> Client:
+    if _supabase_client is None:
+        raise RuntimeError("Supabase client not initialized.")
+    return _supabase_client
+
+
+@tool
+def apply_for_property(property_id: str, renter_id: str, application_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Renter submits an application for a property."""
+    client = _get_client()
+    try:
+        response = client.table("applications").insert({
+            "property_id": property_id,
+            "renter_id": renter_id,
+            "status": "pending",
+            "application_data": application_data,
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+
+        if response.data:
+            item = cast(Dict[str, Any], response.data[0])
+            return {"status": "SUCCESS", "application_id": item.get("id"), "message": "Application submitted successfully."}
+        return {"status": "ERROR", "message": "Failed to submit application."}
+    except Exception as e:
+        logger.error(f"Application submission error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def view_applications(property_id: str) -> Dict[str, Any]:
+    """Landlord views all applications for a property."""
+    client = _get_client()
+    try:
+        response = client.table("applications").select("*").eq("property_id", property_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "applications": response.data, "count": len(response.data)}
+        return {"status": "SUCCESS", "applications": [], "count": 0, "message": "No applications yet."}
+    except Exception as e:
+        logger.error(f"View applications error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def view_application_details(application_id: str) -> Dict[str, Any]:
+    """Get detailed information about a specific application."""
+    client = _get_client()
+    try:
+        response = client.table("applications").select("*").eq("id", application_id).maybe_single().execute()
+        if response.data:
+            return {"status": "SUCCESS", "application": response.data}
+        return {"status": "ERROR", "message": "Application not found."}
+    except Exception as e:
+        logger.error(f"View application details error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def approve_application(application_id: str, landlord_id: str) -> Dict[str, Any]:
+    """Landlord approves a renter's application."""
+    client = _get_client()
+    try:
+        response = client.table("applications").update({
+            "status": "approved",
+            "approved_by": landlord_id,
+            "approved_at": datetime.utcnow().isoformat()
+        }).eq("id", application_id).execute()
+
+        if response.data:
+            return {"status": "SUCCESS", "message": "Application approved. A lease will be prepared."}
+        return {"status": "ERROR", "message": "Failed to approve application."}
+    except Exception as e:
+        logger.error(f"Approve application error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def deny_application(application_id: str, landlord_id: str, reason: str = "") -> Dict[str, Any]:
+    """Landlord denies a renter's application."""
+    client = _get_client()
+    try:
+        response = client.table("applications").update({
+            "status": "denied",
+            "denied_by": landlord_id,
+            "denial_reason": reason,
+            "denied_at": datetime.utcnow().isoformat()
+        }).eq("id", application_id).execute()
+
+        if response.data:
+            return {"status": "SUCCESS", "message": "Application denied."}
+        return {"status": "ERROR", "message": "Failed to deny application."}
+    except Exception as e:
+        logger.error(f"Deny application error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def get_renter_applications(renter_id: str) -> Dict[str, Any]:
+    """Renter views all their applications."""
+    client = _get_client()
+    try:
+        response = client.table("applications").select("*").eq("renter_id", renter_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "applications": response.data, "count": len(response.data)}
+        return {"status": "SUCCESS", "applications": [], "count": 0, "message": "You have no applications yet."}
+    except Exception as e:
+        logger.error(f"Get renter applications error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+</file>
+
+<file path="data_layer/mcp_lease.py">
+import json
+import logging
+from typing import Dict, Any, Optional, cast
+from langchain_core.tools import tool
+from supabase import Client
+from datetime import datetime
+
+_supabase_client: Optional[Client] = None
+logger = logging.getLogger(__name__)
+
+
+def set_client(client: Client) -> None:
+    global _supabase_client
+    _supabase_client = client
+
+
+def _get_client() -> Client:
+    if _supabase_client is None:
+        raise RuntimeError("Supabase client not initialized.")
+    return _supabase_client
+
+
+@tool
+def create_lease(property_id: str, renter_id: str, landlord_id: str, lease_terms: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a lease contract after application is approved."""
+    client = _get_client()
+    try:
+        response = client.table("leases").insert({
+            "property_id": property_id,
+            "renter_id": renter_id,
+            "landlord_id": landlord_id,
+            "lease_terms": lease_terms,
+            "status": "unsigned",
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+
+        if response.data:
+            item = cast(Dict[str, Any], response.data[0])
+            return {"status": "SUCCESS", "lease_id": item.get("id"), "message": "Lease created and sent for signing."}
+        return {"status": "ERROR", "message": "Failed to create lease."}
+    except Exception as e:
+        logger.error(f"Create lease error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def sign_lease(lease_id: str, signer_id: str) -> Dict[str, Any]:
+    """Renter or landlord signs the lease contract."""
+    client = _get_client()
+    try:
+        response = client.table("leases").select("*").eq("id", lease_id).maybe_single().execute()
+        if not response.data:
+            return {"status": "ERROR", "message": "Lease not found."}
+
+        lease = cast(Dict[str, Any], response.data)
+        signed_by = lease.get("signed_by", {})
+        if not isinstance(signed_by, dict):
+            signed_by = {}
+        signed_by[signer_id] = datetime.utcnow().isoformat()
+
+        # Check if both parties have signed
+        is_fully_signed = len(signed_by) >= 2
+
+        update_response = client.table("leases").update({
+            "signed_by": signed_by,
+            "status": "signed" if is_fully_signed else "partially_signed",
+            "signed_at": datetime.utcnow().isoformat() if is_fully_signed else None
+        }).eq("id", lease_id).execute()
+
+        if update_response.data:
+            message = "Lease fully signed and agreement is now active!" if is_fully_signed else "Lease signature recorded. Awaiting other party's signature."
+            return {"status": "SUCCESS", "message": message}
+        return {"status": "ERROR", "message": "Failed to sign lease."}
+    except Exception as e:
+        logger.error(f"Sign lease error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def get_lease_details(lease_id: str) -> Dict[str, Any]:
+    """Get the details of a lease contract."""
+    client = _get_client()
+    try:
+        response = client.table("leases").select("*").eq("id", lease_id).maybe_single().execute()
+        if response.data:
+            return {"status": "SUCCESS", "lease": response.data}
+        return {"status": "ERROR", "message": "Lease not found."}
+    except Exception as e:
+        logger.error(f"Get lease details error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def get_active_leases(user_id: str) -> Dict[str, Any]:
+    """Get all active leases for a user (as renter or landlord)."""
+    client = _get_client()
+    try:
+        renter_leases = client.table("leases").select("*").eq("renter_id", user_id).eq("status", "signed").execute()
+        landlord_leases = client.table("leases").select("*").eq("landlord_id", user_id).eq("status", "signed").execute()
+        
+        all_leases = (renter_leases.data or []) + (landlord_leases.data or [])
+        return {"status": "SUCCESS", "leases": all_leases, "count": len(all_leases)}
+    except Exception as e:
+        logger.error(f"Get active leases error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def terminate_lease(lease_id: str, reason: str = "") -> Dict[str, Any]:
+    """Terminate an active lease."""
+    client = _get_client()
+    try:
+        response = client.table("leases").update({
+            "status": "terminated",
+            "termination_reason": reason,
+            "terminated_at": datetime.utcnow().isoformat()
+        }).eq("id", lease_id).execute()
+
+        if response.data:
+            return {"status": "SUCCESS", "message": "Lease terminated."}
+        return {"status": "ERROR", "message": "Failed to terminate lease."}
+    except Exception as e:
+        logger.error(f"Terminate lease error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+</file>
+
+<file path="data_layer/mcp_property.py">
+import json
+import logging
+from typing import Dict, Any, List, Optional, cast
+import uuid
+from langchain_core.tools import tool
+from supabase import Client
+from data_layer.schemas.add_property_input import AddPropertyInput
+from data_layer.vector_service import vectorize_property_data
+
+# Global state initialized safely
+_supabase_client: Optional[Client] = None
+logger = logging.getLogger(__name__)
+
+
+def set_client(client: Client) -> None:
+    global _supabase_client
+    _supabase_client = client
+
+
+def _get_client() -> Client:
+    if _supabase_client is None:
+        raise RuntimeError("Supabase client not initialized. Call set_client() before using tools.")
+    return _supabase_client
+
+
+def format_tool_output(data: Any) -> str:
+    """Ensures tool output is a JSON string, handling potential errors."""
+    if isinstance(data, str):
+        return data
+    try:
+        return json.dumps(data)
+    except (TypeError, ValueError):
+        return str(data)
+
+# --- Core Tools ---
+
+
+@tool(args_schema=AddPropertyInput)
+def add_new_property_record(address: str,
+    location: str,
+    base_price: float,
+    owner_id: str,
+    specs: Dict[str, Any]) -> str:
+    """Creates a new property record and returns the new property ID."""
+    client = _get_client()
+    
+    # 1. CHECK FOR EXISTING (Defensive)
+    try:
+        existing = client.table("properties").select("id").eq("address", address).execute()
+        # Verify if data exists BEFORE accessing index 0
+        raw_data = existing.data
+        if isinstance(raw_data, list) and len(raw_data) > 0:
+            item = cast(Dict[str, Any], raw_data[0])
+            
+            return json.dumps({"status": "ALREADY_EXISTS", "id": item['id']})
+    except Exception as e:
+        logger.error(f"Error checking for existing property: {e}")
+        # Proceed to creation or return error; usually safer to let it try to create if check fails
+    
+    # 2. CREATE
+    
+    safe_specs = specs or {}
+        
+    try:
+        response = client.table("properties").insert({
+            "address": address,
+            "base_price": base_price,
+            "location": location,  # New field
+            "specs": safe_specs,
+            "owner_id": owner_id
+        }).execute()
+        
+        if not response.data:
+            return json.dumps({"status": "ERROR", "message": "Failed to insert property"})
+            
+        item = cast(Dict[str, Any], response.data[0])
+        property_id = item['id']
+        
+        # 3. VECTORIZE
+        try:
+            embedding = vectorize_property_data(address, owner_id, location, specs)
+            client.table("properties").update({
+                "vector_embedding": embedding
+            }).eq("id", property_id).execute()
+        except Exception as e:
+            logger.error(f"Vectorization failed for {property_id}: {e}")
+            # We continue because the property is already created
+        
+        return json.dumps({"status": "SUCCESS", "id": property_id})
+        
+    except Exception as e:
+        return json.dumps({"status": "ERROR", "message": str(e)})
+
+
+def is_valid_uuid(val):
+    try:
+        uuid.UUID(str(val))
+        return True
+    except ValueError:
+        return False
+
+
+@tool
+def fetch_property_by_uuid(property_id: str) -> Dict[str, Any]:
+    """
+   REQUIRED: Provide a specific property_id (UUID).
+    DO NOT use this tool to add, create, or register new properties.
+    If you have creation data (address, price, features), you must use 'add_new_property_record'.
+    """
+    client = _get_client()
+    response = client.table("properties").select("*").eq("id", property_id).maybe_single().execute()
+    if response is None:
+        return {"error": "Internal Database Error"}
+        
+    # 2. Handle missing data (maybe_single returns None for data if not found)
+    if response.data is None:
+        return {"error": "Property not found"}
+        
+    # 3. Explicitly cast the dynamic 'data' to the expected Dict[str, Any]
+    # This silences the type checker and confirms you are handling the dynamic return
+    return cast(Dict[str, Any], response.data)
+
+
+@tool
+def update_property(property_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Updates property fields."""
+    if not is_valid_uuid(property_id):
+        raise ValueError(f"Invalid UUID: {property_id}")
+        
+    client = _get_client()
+    response = client.table("properties").update(update_data).eq("id", property_id).execute()
+    
+    # Defensive list access
+    if response.data and len(response.data) > 0:
+        return cast(Dict[str, Any], response.data[0])
+    
+    return {"status": "ERROR", "message": "Property not found or update failed"}
+
+
+@tool
+def delete_property(property_id: str) -> Dict[str, Any]:
+    """Soft deletes a property record."""
+    if not is_valid_uuid(property_id):
+        raise ValueError(f"Agent attempted to use an invalid property ID: {property_id}. "
+                         "This is likely a hallucinated placeholder.")
+    client = _get_client()
+    client.table("properties").update({"deleted_at": "now()"}).eq("id", property_id).execute()
+    return {"status": "SUCCESS"}
+</file>
+
+<file path="data_layer/mcp_user.py">
+import json
+import logging
+from typing import Dict, Any, Optional
+from langchain_core.tools import tool
+from supabase import Client
+
+logger = logging.getLogger(__name__)
+
+_supabase_client: Optional[Client] = None
+
+def set_client(client: Client) -> None:
+    global _supabase_client
+    _supabase_client = client
+
+def _get_client() -> Client:
+    if _supabase_client is None:
+        raise RuntimeError("Supabase client not initialized.")
+    return _supabase_client
+
+
+
+@tool
+def get_user_profile(user_id: Optional[str] = None) -> str:
+    """Retrieves current user profile. If user_id is None, returns error."""
+    if not user_id:
+        return json.dumps({"status": "no_session", "message": "No active user session detected."})
+    
+    try:
+        response = _get_client().table("profiles").select("*").eq("id", user_id).single().execute()
+        return json.dumps({"status": "success", "data": response.data})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+@tool
+def update_user_profile(updates: Dict[str, Any], user_id: Optional[str] = None) -> str:
+    """Updates the profile for the current user_id."""
+    if not user_id:
+        return json.dumps({"status": "no_session", "message": "No active user session detected."})
+
+    try:
+        response = _get_client().table("profiles").update(updates).eq("id", user_id).execute()
+        return json.dumps({"status": "success", "data": response.data})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+</file>
+
+<file path="LEASING_FLOW.md">
+## House Padi Leasing Flow Documentation
+
+This document describes the complete renter and landlord workflows for the leasing process.
+
+### Architecture Overview
+
+**New Agents:**
+- `renter`: Guides renters through property search, tour booking, application submission, and lease signing
+- `landlord`: Enables landlords to manage tour requests, review applications, and sign leases
+
+**New Tools (24 total):**
+
+#### Application Management (6 tools)
+- `apply_for_property`: Renter submits application for a property
+- `view_applications`: Landlord views all applications for their property
+- `view_application_details`: Get details of a specific application
+- `approve_application`: Landlord approves a renter's application
+- `deny_application`: Landlord denies an application with optional reason
+- `get_renter_applications`: Renter views their own applications
+
+#### Lease Management (5 tools)
+- `create_lease`: Create a lease contract after application approval
+- `sign_lease`: Renter or landlord signs the lease
+- `get_lease_details`: View lease contract details
+- `get_active_leases`: View all active leases (as renter or landlord)
+- `terminate_lease`: Terminate an active lease
+
+#### Tour Management (Landlord-side, 5 new tools)
+- `view_tour_requests`: Landlord views all tour requests for a property
+- `approve_tour_request`: Landlord approves a tour request
+- `deny_tour_request`: Landlord denies a tour request
+- `reschedule_tour`: Landlord reschedules a tour to a new date
+- `get_renter_tour_requests`: Renter views their own tour requests
+
+---
+
+## RENTER WORKFLOW
+
+### Phase 1: Property Discovery & Interest
+**Flow:** `renter` agent → `search_semantic_listings` → Filter by preferences
+
+**User Intent:** "I'm looking for a 2-bedroom apartment in Lagos with a budget of 500,000 naira"
+
+**Expected Output:**
+```
+Here are some 2-bedroom apartments in Lagos within your budget:
+1. Beautiful apartment in Ikoyi - ₦450,000/month
+2. Modern flat in Victoria Island - ₦480,000/month
+3. Cozy apartment in Yaba - ₦420,000/month
+
+Would you like to see more details about any of these, or book a tour?
+```
+
+### Phase 2: Tour Booking
+**Flow:** `renter` agent → `schedule_tour` → Tour request sent to landlord
+
+**User Intent:** "I'd like to tour the apartment in Ikoyi tomorrow at 2 PM"
+
+**Expected Output:**
+```
+Your tour has been scheduled for tomorrow at 2:00 PM at the Ikoyi apartment.
+The landlord will receive your request and confirm within 24 hours.
+In the meantime, feel free to search for other properties.
+```
+
+**Landlord Receives:**
+- Tour request notification with renter details and preferred time
+- Options to approve, deny, or reschedule
+
+### Phase 3: Application Submission (After Positive Tour)
+**Flow:** `renter` agent → `apply_for_property` → Application data
+
+**User Intent:** "I loved the apartment! I'd like to apply for it."
+
+**System Prompt to Renter:**
+```
+To complete your application, I'll need:
+1. Your employment status (employed/self-employed/student)
+2. Monthly income
+3. References (landlord or employer contact)
+4. Move-in date preference
+```
+
+**Expected Output After Data Collection:**
+```
+Your application has been submitted to the landlord.
+The landlord will review it and respond within 2-3 business days.
+Keep an eye on your notifications for updates.
+```
+
+### Phase 4: Lease Signing (After Application Approval)
+**Flow:** `renter` agent → `sign_lease` → Lease agreement
+
+**Landlord Action:** Approves application → `create_lease` → Lease sent to renter
+
+**Renter Receives:**
+```
+Great news! Your application has been approved!
+A lease agreement has been sent to you with the following terms:
+- Monthly rent: ₦450,000
+- Lease duration: 12 months
+- Move-in date: June 15, 2026
+- Deposit: ₦450,000
+
+Please review and sign the lease to finalize the deal.
+```
+
+**User Intent:** "I'll sign the lease"
+
+**Expected Output:**
+```
+Lease signed by you. The landlord will review and sign to complete the agreement.
+Once both parties sign, your lease will be active and you'll receive all lease documents.
+```
+
+---
+
+## LANDLORD WORKFLOW
+
+### Phase 1: Receive & Manage Tour Requests
+**Flow:** Renter submits tour request → `landlord` agent → `view_tour_requests`
+
+**Landlord Intent:** "Show me all tour requests for my Ikoyi property"
+
+**Expected Output:**
+```
+You have 3 tour requests for your Ikoyi property:
+
+1. John Doe - Requested for June 15 at 2:00 PM
+   Contact: john@example.com | +234 812 345 6789
+   [Approve] [Deny] [Reschedule]
+
+2. Jane Smith - Requested for June 16 at 10:00 AM
+   Contact: jane@example.com | +234 902 345 6789
+   [Approve] [Deny] [Reschedule]
+
+3. Michael Johnson - Requested for June 17 at 4:00 PM
+   Contact: michael@example.com | +234 913 345 6789
+   [Approve] [Deny] [Reschedule]
+```
+
+**Actions:**
+- **Approve:** `approve_tour_request` → Renter receives confirmation
+- **Deny:** `deny_tour_request` → Renter receives denial reason
+- **Reschedule:** `reschedule_tour` → New time sent to renter for confirmation
+
+### Phase 2: Review & Manage Applications
+**Flow:** Renter submits application → `landlord` agent → `view_applications`
+
+**Landlord Intent:** "Show me all applications for my Ikoyi property"
+
+**Expected Output:**
+```
+You have 2 applications for your Ikoyi property:
+
+1. John Doe - Applied on June 15
+   Employment: Employed at Tech Company
+   Monthly Income: ₦800,000
+   References: previous_landlord@email.com
+   Status: Pending
+   [View Details] [Approve] [Deny]
+
+2. Jane Smith - Applied on June 16
+   Employment: Self-employed (Consultant)
+   Monthly Income: ₦1,200,000
+   References: jane_employer@email.com
+   Status: Pending
+   [View Details] [Approve] [Deny]
+```
+
+**Landlord Intent:** "Approve Jane Smith's application"
+
+**Expected Output:**
+```
+Application approved! A lease agreement will be prepared and sent to Jane Smith immediately.
+She'll receive the lease terms and will need to sign within 3 days.
+```
+
+**Landlord Intent:** "Deny John Doe's application due to insufficient income"
+
+**Expected Output:**
+```
+Application denied. John Doe will be notified with the reason:
+"Unfortunately, your monthly income does not meet our minimum requirement."
+
+You can send him alternative property recommendations.
+```
+
+### Phase 3: Create & Sign Lease
+**Flow:** Application approved → `create_lease` → Both parties sign
+
+**System Action (Automatic on Approval):**
+- Lease document generated with:
+  - Property details
+  - Monthly rent amount
+  - Lease duration
+  - Move-in date
+  - Security deposit terms
+  - Payment schedule
+
+**Landlord Intent:** "I want to view the lease for John's application to make sure the terms are correct"
+
+**Expected Output:**
+```
+Lease #UUID details:
+- Property: Ikoyi apartment (3 bedrooms, 2 bathrooms)
+- Renter: John Doe
+- Monthly Rent: ₦450,000
+- Lease Term: 12 months (June 15, 2026 - June 14, 2027)
+- Security Deposit: ₦450,000
+- Payment Due: 1st of each month
+
+Lease Status: Unsigned (Awaiting signatures)
+[Sign Lease] [Edit Terms] [Send Reminder]
+```
+
+**Landlord Signs:**
+```
+Lease signed by you!
+The renter will be notified to review and sign the lease.
+Once both parties sign, the lease becomes active.
+```
+
+### Phase 4: Monitor Active Leases
+**Flow:** Both parties signed → Lease active
+
+**Landlord Intent:** "Show me all my active leases"
+
+**Expected Output:**
+```
+You have 3 active leases:
+
+1. John Doe - Ikoyi apartment
+   Rent: ₦450,000/month
+   Duration: 12 months (June 15, 2026 - June 14, 2027)
+   Monthly Payment: Due on 1st
+   Days Remaining: 360
+   Status: Active
+   [View Details] [Send Reminder] [Terminate]
+
+2. Jane Smith - Victoria Island apartment
+   Rent: ₦580,000/month
+   Duration: 12 months (June 1, 2026 - May 31, 2027)
+   Monthly Payment: Due on 15th
+   Days Remaining: 350
+   Status: Active
+   [View Details] [Send Reminder] [Terminate]
+
+3. Michael Johnson - Yaba apartment
+   Rent: ₦320,000/month
+   Duration: 6 months (April 1, 2026 - September 30, 2026)
+   Monthly Payment: Due on 10th
+   Days Remaining: 112
+   Status: Active (Ending Soon)
+   [View Details] [Send Reminder] [Renew] [Terminate]
+```
+
+---
+
+## Future Enhancements (DO NOT IMPLEMENT YET)
+
+These features are designed with extensibility in mind but are NOT part of Phase 1:
+
+1. **Calendar Integration Agent**
+   - Sync tour dates with landlord's calendar
+   - Automatic reminder notifications
+
+2. **Notification Agent**
+   - Send email confirmations for tour approvals
+   - SMS/WhatsApp reminders for lease signings
+   - Payment reminders (automated)
+
+3. **Lease Tracking Agent**
+   - Monitor lease expiration dates
+   - Send renewal notifications 30/60/90 days before expiry
+   - Track late payments
+
+4. **Document Management**
+   - Store signed lease PDFs
+   - Generate lease contracts with dynamic fields
+   - Archive completed leases
+
+### Design Principles for Future Extensibility
+
+1. **Agent Independence:** Each new agent should be self-contained with its own tool set
+2. **Tool Composability:** New tools should leverage existing database tables
+3. **Message Routing:** The orchestrator's router node will automatically direct to new agents
+4. **Backward Compatibility:** Existing agents should not require changes
+
+---
+
+## Database Schema
+
+### applications table
+```sql
+id, property_id, renter_id, status, application_data, 
+approved_by, approved_at, denied_by, denial_reason, denied_at, 
+created_at, updated_at
+```
+
+### leases table
+```sql
+id, property_id, renter_id, landlord_id, lease_terms, status, 
+signed_by (JSON), signed_at, termination_reason, terminated_at,
+created_at, updated_at
+```
+
+### tours table (updated)
+```sql
+... existing fields ...
+visitor_id, denial_reason
+```
+
+---
+
+## Human-Readable Response Guidelines
+
+All agent responses must follow these rules:
+
+✅ **DO:**
+- Use natural language (no JSON, no code)
+- Ask clarifying questions clearly
+- Provide next-step guidance
+- Use friendly, professional tone
+- Format options clearly (1. Option A, 2. Option B)
+
+❌ **DON'T:**
+- Output raw JSON or database records
+- Use technical jargon
+- Show tool names or parameters
+- Provide pseudo-code or API documentation
+- Mix tools with conversational text
+
+**Example of Correct Response:**
+```
+I found 3 properties that match your criteria. The most popular one is 
+a beautiful 2-bedroom in Ikoyi for ₦450,000 per month. It has a modern 
+kitchen and secured parking. Would you like to book a tour for it?
+```
+
+**Example of Incorrect Response:**
+```
+{
+  "status": "SUCCESS",
+  "properties": [
+    {"id": "uuid123", "address": "Ikoyi", "price": 450000, ...}
+  ]
+}
+
+Search completed. Call schedule_tour with property_id and tour_date.
+```
+
+---
+
+## Testing Scenarios
+
+### Scenario 1: Complete Renter Journey (Happy Path)
+1. Renter searches for 2-bed apartment in Lagos, budget ₦500k
+2. Renter books tour for apartment in Ikoyi
+3. Landlord approves tour
+4. Renter applies for apartment
+5. Landlord approves application
+6. Lease created and sent to both parties
+7. Both renter and landlord sign lease
+8. Lease becomes active
+
+### Scenario 2: Landlord Denies Tour Request
+1. Renter requests tour
+2. Landlord denies with reason "Apartment already rented"
+3. System suggests alternative properties to renter
+
+### Scenario 3: Landlord Denies Application
+1. Renter applies for property
+2. Landlord reviews application and denies with reason
+3. Renter receives notification with feedback
+4. Renter can search for other properties
+
+### Scenario 4: Lease Termination
+1. Active lease exists between renter and landlord
+2. Landlord initiates lease termination
+3. System archives lease record
+4. Both parties receive confirmation
+
+---
+
+## Implementation Checklist
+
+✅ Created `mcp_application.py` with 6 tools
+✅ Created `mcp_lease.py` with 5 tools
+✅ Updated `mcp_tour.py` with 5 landlord-side tools
+✅ Added validators for all new tools in `tool_validators.py`
+✅ Created migration: `20260608_add_applications_and_leases.sql`
+✅ Registered `renter` agent with authorized tools
+✅ Registered `landlord` agent with authorized tools
+✅ Updated `prompts.json` with new agent instructions
+✅ Updated `mcp_oracle.py` to expose all new tools
+✅ All type checking passes (no errors)
+
+**Next Steps for Testing:**
+1. Apply migration to Supabase database
+2. Test renter workflow end-to-end
+3. Test landlord workflow end-to-end
+4. Verify human-readable responses (no JSON output)
+5. Document any edge cases or improvements
+</file>
+
+<file path="README.md">
+
+</file>
+
+<file path="supabase/.gitignore">
+# Supabase
+.branches
+.temp
+
+# dotenvx
+.env.keys
+.env.local
+.env.*.local
+</file>
+
+<file path="supabase/config.toml">
+# For detailed configuration reference documentation, visit:
+# https://supabase.com/docs/guides/local-development/cli/config
+# A string used to distinguish different Supabase projects on the same host. Defaults to the
+# working directory name when running `supabase init`.
+project_id = "house-padi-backend"
+
+[api]
+enabled = true
+# Port to use for the API URL.
+port = 54321
+# Schemas to expose in your API. Tables, views and stored procedures in this schema will get API
+# endpoints. `public` and `graphql_public` schemas are included by default.
+schemas = ["public", "graphql_public"]
+# Extra schemas to add to the search_path of every request.
+extra_search_path = ["public", "extensions"]
+# The maximum number of rows returns from a view, table, or stored procedure. Limits payload size
+# for accidental or malicious requests.
+max_rows = 1000
+# Controls whether new tables, views, sequences and functions created in the `public` schema by
+# `postgres` are reachable through the Data API roles (`anon`, `authenticated`, `service_role`)
+# without explicit GRANTs. Leave unset today to preserve local behaviour. The implicit default
+# flips to `false` on 2026-05-30 to match the new cloud default, and the field is removed in
+# 2026-10-30 once the always-revoked behaviour is permanent. Set to `false` to opt in early.
+# auto_expose_new_tables = false
+
+[api.tls]
+# Enable HTTPS endpoints locally using a self-signed certificate.
+enabled = false
+# Paths to self-signed certificate pair.
+# cert_path = "../certs/my-cert.pem"
+# key_path = "../certs/my-key.pem"
+
+[db]
+# Port to use for the local database URL.
+port = 54322
+# Port used by db diff command to initialize the shadow database.
+shadow_port = 54320
+# Maximum amount of time to wait for health check when starting the local database.
+health_timeout = "2m"
+# The database major version to use. This has to be the same as your remote database's. Run `SHOW
+# server_version;` on the remote database to check.
+major_version = 17
+
+[db.pooler]
+enabled = false
+# Port to use for the local connection pooler.
+port = 54329
+# Specifies when a server connection can be reused by other clients.
+# Configure one of the supported pooler modes: `transaction`, `session`.
+pool_mode = "transaction"
+# How many server connections to allow per user/database pair.
+default_pool_size = 20
+# Maximum number of client connections allowed.
+max_client_conn = 100
+
+# [db.vault]
+# secret_key = "env(SECRET_VALUE)"
+
+[db.migrations]
+# If disabled, migrations will be skipped during a db push or reset.
+enabled = true
+# Specifies an ordered list of schema files that describe your database.
+# Supports glob patterns relative to supabase directory: "./schemas/*.sql"
+schema_paths = []
+
+[db.seed]
+# If enabled, seeds the database after migrations during a db reset.
+enabled = true
+# Specifies an ordered list of seed files to load during db reset.
+# Supports glob patterns relative to supabase directory: "./seeds/*.sql"
+sql_paths = ["./seed.sql"]
+
+[db.network_restrictions]
+# Enable management of network restrictions.
+enabled = false
+# List of IPv4 CIDR blocks allowed to connect to the database.
+# Defaults to allow all IPv4 connections. Set empty array to block all IPs.
+allowed_cidrs = ["0.0.0.0/0"]
+# List of IPv6 CIDR blocks allowed to connect to the database.
+# Defaults to allow all IPv6 connections. Set empty array to block all IPs.
+allowed_cidrs_v6 = ["::/0"]
+
+# Uncomment to reject non-secure connections to the database.
+# [db.ssl_enforcement]
+# enabled = true
+
+[realtime]
+enabled = true
+# Bind realtime via either IPv4 or IPv6. (default: IPv4)
+# ip_version = "IPv6"
+# The maximum length in bytes of HTTP request headers. (default: 4096)
+# max_header_length = 4096
+
+[studio]
+enabled = true
+# Port to use for Supabase Studio.
+port = 54323
+# External URL of the API server that frontend connects to.
+api_url = "http://127.0.0.1"
+# OpenAI API Key to use for Supabase AI in the Supabase Studio.
+openai_api_key = "env(OPENAI_API_KEY)"
+
+# Email testing server. Emails sent with the local dev setup are not actually sent - rather, they
+# are monitored, and you can view the emails that would have been sent from the web interface.
+[inbucket]
+enabled = true
+# Port to use for the email testing server web interface.
+port = 54324
+# Uncomment to expose additional ports for testing user applications that send emails.
+# smtp_port = 54325
+# pop3_port = 54326
+# admin_email = "admin@email.com"
+# sender_name = "Admin"
+
+[storage]
+enabled = true
+# The maximum file size allowed (e.g. "5MB", "500KB").
+file_size_limit = "50MiB"
+
+# Uncomment to configure local storage buckets
+# [storage.buckets.images]
+# public = false
+# file_size_limit = "50MiB"
+# allowed_mime_types = ["image/png", "image/jpeg"]
+# objects_path = "./images"
+
+# Allow connections via S3 compatible clients
+[storage.s3_protocol]
+enabled = true
+
+# Image transformation API is available to Supabase Pro plan.
+# [storage.image_transformation]
+# enabled = true
+
+# Store analytical data in S3 for running ETL jobs over Iceberg Catalog
+# This feature is only available on the hosted platform.
+[storage.analytics]
+enabled = false
+max_namespaces = 5
+max_tables = 10
+max_catalogs = 2
+
+# Analytics Buckets is available to Supabase Pro plan.
+# [storage.analytics.buckets.my-warehouse]
+
+# Store vector embeddings in S3 for large and durable datasets
+[storage.vector]
+enabled = true
+max_buckets = 10
+max_indexes = 5
+
+# Vector Buckets is available to Supabase Pro plan.
+# [storage.vector.buckets.documents-openai]
+
+[auth]
+enabled = true
+# The base URL of your website. Used as an allow-list for redirects and for constructing URLs used
+# in emails.
+site_url = "http://127.0.0.1:3000"
+# The public URL that Auth serves on. Defaults to the API external URL with `/auth/v1` appended.
+# external_url = ""
+# A list of *exact* URLs that auth providers are permitted to redirect to post authentication.
+additional_redirect_urls = ["https://127.0.0.1:3000"]
+# How long tokens are valid for, in seconds. Defaults to 3600 (1 hour), maximum 604,800 (1 week).
+jwt_expiry = 3600
+# JWT issuer URL. If not set, defaults to auth.external_url.
+# jwt_issuer = ""
+# Path to JWT signing key. DO NOT commit your signing keys file to git.
+# signing_keys_path = "./signing_keys.json"
+# If disabled, the refresh token will never expire.
+enable_refresh_token_rotation = true
+# Allows refresh tokens to be reused after expiry, up to the specified interval in seconds.
+# Requires enable_refresh_token_rotation = true.
+refresh_token_reuse_interval = 10
+# Allow/disallow new user signups to your project.
+enable_signup = true
+# Allow/disallow anonymous sign-ins to your project.
+enable_anonymous_sign_ins = false
+# Allow/disallow testing manual linking of accounts
+enable_manual_linking = false
+# Passwords shorter than this value will be rejected as weak. Minimum 6, recommended 8 or more.
+minimum_password_length = 6
+# Passwords that do not meet the following requirements will be rejected as weak. Supported values
+# are: `letters_digits`, `lower_upper_letters_digits`, `lower_upper_letters_digits_symbols`
+password_requirements = ""
+
+# Configure passkey sign-ins.
+# [auth.passkey]
+# enabled = false
+
+# Configure WebAuthn relying party settings (required when passkey is enabled).
+# [auth.webauthn]
+# rp_display_name = "Supabase"
+# rp_id = "localhost"
+# rp_origins = ["http://127.0.0.1:3000"]
+
+[auth.rate_limit]
+# Number of emails that can be sent per hour. Requires auth.email.smtp to be enabled.
+email_sent = 2
+# Number of SMS messages that can be sent per hour. Requires auth.sms to be enabled.
+sms_sent = 30
+# Number of anonymous sign-ins that can be made per hour per IP address. Requires enable_anonymous_sign_ins = true.
+anonymous_users = 30
+# Number of sessions that can be refreshed in a 5 minute interval per IP address.
+token_refresh = 150
+# Number of sign up and sign-in requests that can be made in a 5 minute interval per IP address (excludes anonymous users).
+sign_in_sign_ups = 30
+# Number of OTP / Magic link verifications that can be made in a 5 minute interval per IP address.
+token_verifications = 30
+# Number of Web3 logins that can be made in a 5 minute interval per IP address.
+web3 = 30
+
+# Configure one of the supported captcha providers: `hcaptcha`, `turnstile`.
+# [auth.captcha]
+# enabled = true
+# provider = "hcaptcha"
+# secret = ""
+
+[auth.email]
+# Allow/disallow new user signups via email to your project.
+enable_signup = true
+# If enabled, a user will be required to confirm any email change on both the old, and new email
+# addresses. If disabled, only the new email is required to confirm.
+double_confirm_changes = true
+# If enabled, users need to confirm their email address before signing in.
+enable_confirmations = false
+# If enabled, users will need to reauthenticate or have logged in recently to change their password.
+secure_password_change = false
+# Controls the minimum amount of time that must pass before sending another signup confirmation or password reset email.
+max_frequency = "1s"
+# Number of characters used in the email OTP.
+otp_length = 6
+# Number of seconds before the email OTP expires (defaults to 1 hour).
+otp_expiry = 3600
+
+# Use a production-ready SMTP server
+# [auth.email.smtp]
+# enabled = true
+# host = "smtp.sendgrid.net"
+# port = 587
+# user = "apikey"
+# pass = "env(SENDGRID_API_KEY)"
+# admin_email = "admin@email.com"
+# sender_name = "Admin"
+
+# Uncomment to customize email template
+# [auth.email.template.invite]
+# subject = "You have been invited"
+# content_path = "./supabase/templates/invite.html"
+
+# Uncomment to customize notification email template
+# [auth.email.notification.password_changed]
+# enabled = true
+# subject = "Your password has been changed"
+# content_path = "./templates/password_changed_notification.html"
+
+[auth.sms]
+# Allow/disallow new user signups via SMS to your project.
+enable_signup = false
+# If enabled, users need to confirm their phone number before signing in.
+enable_confirmations = false
+# Template for sending OTP to users
+template = "Your code is {{ `{{ .Code }}` }}"
+# Controls the minimum amount of time that must pass before sending another sms otp.
+max_frequency = "5s"
+
+# Use pre-defined map of phone number to OTP for testing.
+# [auth.sms.test_otp]
+# 4152127777 = "123456"
+
+# Configure logged in session timeouts.
+# [auth.sessions]
+# Force log out after the specified duration.
+# timebox = "24h"
+# Force log out if the user has been inactive longer than the specified duration.
+# inactivity_timeout = "8h"
+
+# This hook runs before a new user is created and allows developers to reject the request based on the incoming user object.
+# [auth.hook.before_user_created]
+# enabled = true
+# uri = "pg-functions://postgres/auth/before-user-created-hook"
+
+# This hook runs before a token is issued and allows you to add additional claims based on the authentication method used.
+# [auth.hook.custom_access_token]
+# enabled = true
+# uri = "pg-functions://<database>/<schema>/<hook_name>"
+
+# Configure one of the supported SMS providers: `twilio`, `twilio_verify`, `messagebird`, `textlocal`, `vonage`.
+[auth.sms.twilio]
+enabled = false
+account_sid = ""
+message_service_sid = ""
+# DO NOT commit your Twilio auth token to git. Use environment variable substitution instead:
+auth_token = "env(SUPABASE_AUTH_SMS_TWILIO_AUTH_TOKEN)"
+
+# Multi-factor-authentication is available to Supabase Pro plan.
+[auth.mfa]
+# Control how many MFA factors can be enrolled at once per user.
+max_enrolled_factors = 10
+
+# Control MFA via App Authenticator (TOTP)
+[auth.mfa.totp]
+enroll_enabled = false
+verify_enabled = false
+
+# Configure MFA via Phone Messaging
+[auth.mfa.phone]
+enroll_enabled = false
+verify_enabled = false
+otp_length = 6
+template = "Your code is {{ `{{ .Code }}` }}"
+max_frequency = "5s"
+
+# Configure MFA via WebAuthn
+# [auth.mfa.web_authn]
+# enroll_enabled = true
+# verify_enabled = true
+
+# Use an external OAuth provider. The full list of providers are: `apple`, `azure`, `bitbucket`,
+# `discord`, `facebook`, `github`, `gitlab`, `google`, `keycloak`, `linkedin_oidc`, `notion`, `twitch`,
+# `twitter`, `x`, `slack`, `spotify`, `workos`, `zoom`.
+[auth.external.apple]
+enabled = false
+client_id = ""
+# DO NOT commit your OAuth provider secret to git. Use environment variable substitution instead:
+secret = "env(SUPABASE_AUTH_EXTERNAL_APPLE_SECRET)"
+# Overrides the default auth callback URL derived from auth.external_url.
+redirect_uri = ""
+# Overrides the default auth provider URL. Used to support self-hosted gitlab, single-tenant Azure,
+# or any other third-party OIDC providers.
+url = ""
+# If enabled, the nonce check will be skipped. Required for local sign in with Google auth.
+skip_nonce_check = false
+# If enabled, it will allow the user to successfully authenticate when the provider does not return an email address.
+email_optional = false
+
+# Allow Solana wallet holders to sign in to your project via the Sign in with Solana (SIWS, EIP-4361) standard.
+# You can configure "web3" rate limit in the [auth.rate_limit] section and set up [auth.captcha] if self-hosting.
+[auth.web3.solana]
+enabled = false
+
+# Use Firebase Auth as a third-party provider alongside Supabase Auth.
+[auth.third_party.firebase]
+enabled = false
+# project_id = "my-firebase-project"
+
+# Use Auth0 as a third-party provider alongside Supabase Auth.
+[auth.third_party.auth0]
+enabled = false
+# tenant = "my-auth0-tenant"
+# tenant_region = "us"
+
+# Use AWS Cognito (Amplify) as a third-party provider alongside Supabase Auth.
+[auth.third_party.aws_cognito]
+enabled = false
+# user_pool_id = "my-user-pool-id"
+# user_pool_region = "us-east-1"
+
+# Use Clerk as a third-party provider alongside Supabase Auth.
+[auth.third_party.clerk]
+enabled = false
+# Obtain from https://clerk.com/setup/supabase
+# domain = "example.clerk.accounts.dev"
+
+# OAuth server configuration
+[auth.oauth_server]
+# Enable OAuth server functionality
+enabled = false
+# Path for OAuth consent flow UI
+authorization_url_path = "/oauth/consent"
+# Allow dynamic client registration
+allow_dynamic_registration = false
+
+[edge_runtime]
+enabled = true
+# Supported request policies: `oneshot`, `per_worker`.
+# `per_worker` (default) — enables hot reload during local development.
+# `oneshot` — fallback mode if hot reload causes issues (e.g. in large repos or with symlinks).
+policy = "per_worker"
+# Port to attach the Chrome inspector for debugging edge functions.
+inspector_port = 8083
+# The Deno major version to use.
+deno_version = 2
+
+# [edge_runtime.secrets]
+# secret_key = "env(SECRET_VALUE)"
+
+[analytics]
+enabled = true
+port = 54327
+# Configure one of the supported backends: `postgres`, `bigquery`.
+backend = "postgres"
+
+# Experimental features may be deprecated any time
+[experimental]
+# Configures Postgres storage engine to use OrioleDB (S3)
+orioledb_version = ""
+# Configures S3 bucket URL, eg. <bucket_name>.s3-<region>.amazonaws.com
+s3_host = "env(S3_HOST)"
+# Configures S3 bucket region, eg. us-east-1
+s3_region = "env(S3_REGION)"
+# Configures AWS_ACCESS_KEY_ID for S3 bucket
+s3_access_key = "env(S3_ACCESS_KEY)"
+# Configures AWS_SECRET_ACCESS_KEY for S3 bucket
+s3_secret_key = "env(S3_SECRET_KEY)"
+
+# [experimental.pgdelta]
+# When enabled, pg-delta becomes the active engine for supported schema flows.
+# enabled = false
+# Directory under `supabase/` where declarative files are written.
+# declarative_schema_path = "./database"
+# JSON string passed through to pg-delta SQL formatting.
+# format_options = "{\"keywordCase\":\"upper\",\"indent\":2,\"maxWidth\":80,\"commaStyle\":\"trailing\"}"
+</file>
+
+<file path="supabase/migrations/20260608_add_applications_and_leases.sql">
+-- Create applications table
+CREATE TABLE IF NOT EXISTS applications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    property_id UUID NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+    renter_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    application_data JSONB,
+    approved_by UUID REFERENCES profiles(id),
+    approved_at TIMESTAMP WITH TIME ZONE,
+    denied_by UUID REFERENCES profiles(id),
+    denial_reason TEXT,
+    denied_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    UNIQUE(property_id, renter_id)
+);
+
+-- Create leases table
+CREATE TABLE IF NOT EXISTS leases (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    property_id UUID NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+    renter_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    landlord_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    lease_terms JSONB,
+    status VARCHAR(20) NOT NULL DEFAULT 'unsigned',
+    signed_by JSONB DEFAULT '{}',
+    signed_at TIMESTAMP WITH TIME ZONE,
+    termination_reason TEXT,
+    terminated_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+-- Create indexes for better query performance
+CREATE INDEX idx_applications_property_id ON applications(property_id);
+CREATE INDEX idx_applications_renter_id ON applications(renter_id);
+CREATE INDEX idx_applications_status ON applications(status);
+CREATE INDEX idx_leases_property_id ON leases(property_id);
+CREATE INDEX idx_leases_renter_id ON leases(renter_id);
+CREATE INDEX idx_leases_landlord_id ON leases(landlord_id);
+CREATE INDEX idx_leases_status ON leases(status);
+
+-- Update tours table to include visitor_id if it doesn't exist
+ALTER TABLE tours ADD COLUMN IF NOT EXISTS visitor_id UUID REFERENCES profiles(id);
+ALTER TABLE tours ADD COLUMN IF NOT EXISTS denial_reason TEXT;
+</file>
+
+<file path="tests/__init__.py">
+
+</file>
+
+<file path="tests/search_test.py">
+import os
+from dotenv import load_dotenv
+from supabase import create_client
+from langchain_core.messages import HumanMessage
+from agent_engine.registry import HousePadiAgentRegistry
+from data_layer.mcp_oracle import OracleMCPServer
+from agent_engine.graph import PadiGraphOrchestrator
+from langchain_groq import ChatGroq
+
+# 0. Load setup
+load_dotenv()
+supabase = create_client(os.getenv("SUPABASE_URL") or "", os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "")
+registry = HousePadiAgentRegistry()
+registry.initialize_production_agents()
+
+# Assume your Orchestrator is configured correctly
+orchestrator = PadiGraphOrchestrator(
+    registry=registry,
+    llm_client=ChatGroq(model="llama-3.1-8b-instant", temperature=0.0),
+    oracle=OracleMCPServer(supabase_client=supabase),
+    db_url=os.getenv("DATABASE_URL") or ""
+)
+
+# 1. Define the Search Request
+# Change the content to match your real data
+test_payload = {
+    "messages": [HumanMessage(content="Find me properties located in Lagos with a budget below $600k per year")],
+    "transaction_context": {"property_id": None}
+}
+
+config = {"configurable": {"thread_id": "test-search-session-001"}}
+
+# 2. Execute
+try:
+    print("Invoking search graph...")
+    result = orchestrator.graph.invoke(test_payload, config=config)
+    
+    # 3. Analyze output
+    last_message = result["messages"][-1]
+    
+    print(f"\nFinal Agent Response: {last_message.content}")
+    
+    # Verify if it actually queried the DB
+    tool_calls = [m for m in result["messages"] if hasattr(m, "tool_calls") and m.tool_calls]
+    if tool_calls:
+        print("\n--- Successful Tool Usage ---")
+        for tc in tool_calls[-1].tool_calls:
+            print(f"Tool used: {tc['name']}")
+            print(f"Args used: {tc['args']}")
+    else:
+        print("\nWarning: No tool was called. The agent might have answered from memory.")
+
+except Exception as e:
+    print(f"Test Failed: {e}")
+</file>
+
+<file path="tests/test_system.py">
+import os
+from dotenv import load_dotenv
+from supabase import create_client
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
+from agent_engine.registry import HousePadiAgentRegistry
+from data_layer.mcp_oracle import OracleMCPServer
+from agent_engine.graph import PadiGraphOrchestrator
+
+# 0. Load environment variables
+load_dotenv()
+
+# 1. Setup Infrastructure
+supabase = create_client(os.getenv("SUPABASE_URL") or "", os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "")
+
+registry = HousePadiAgentRegistry()
+registry.initialize_production_agents()
+
+oracle = OracleMCPServer(supabase_client=supabase)
+llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.0)
+
+orchestrator = PadiGraphOrchestrator(
+    registry=registry,
+    llm_client=llm,
+    oracle=oracle,
+    db_url=os.getenv("DATABASE_URL") or ""
+)
+
+# 2. Simulate User Request (CORRECTED: Use HumanMessage object)
+test_payload = {
+    "messages": [HumanMessage(content="Create a new 1 bedroom property for me at 30 Christ Avenue, Lekki Phase 1, Lagos, $200k per year")],
+    "transaction_context": {"property_id": None}
+}
+
+config = {"configurable": {"thread_id": "unique-user-session-123"}}
+
+# 3. Execute Workflow
+try:
+    # 3. Execute Workflow
+    print("Invoking graph...")
+    result = orchestrator.graph.invoke(test_payload, config=config)
+
+    last_message = result["messages"][-1]
+
+    # Print the content if it exists
+    if last_message.content:
+        print("Content:", last_message.content)
+    else:
+        print("No textual content found.")
+
+    # Inspect if there were any tool calls requested
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        print("\n--- Tool Call Detected ---")
+        for tool_call in last_message.tool_calls:
+            print(f"Tool Name: {tool_call['name']}")
+            print(f"Arguments: {tool_call['args']}")
+    else:
+        print("No tool calls detected in this response.")
+except Exception as e:
+    print(f"Execution Failed: {e}")
+</file>
+
+<file path="tests/test_voice_pipeline.py">
+# tests/test_voice_pipeline.py
+import asyncio
+import json
+import unittest.mock as mock
+
+from system_container import HousePadiSystem
+
+
+# 1. Mock Socket to simulate Deepgram's behavior
+class MockDeepgramSocket:
+
+    def __init__(self, prompt):
+        self.prompt = prompt
+        self.closed = False
+    
+    async def __aenter__(self): return self
+
+    async def __aexit__(self, *args): pass
+    
+    async def send(self, data):
+        # We don't care about the raw audio bytes here, 
+        # just simulating the server sending audio to Deepgram
+        pass
+
+    async def __aiter__(self):
+        # Simulate Deepgram sending back a transcript
+        yield json.dumps({
+            "channel": {"alternatives": [{"transcript": self.prompt}]},
+            "is_final": True
+        })
+        # Keep open briefly then close
+        await asyncio.sleep(1) 
+        raise ConnectionError("Mock socket closed")
+
+
+# 2. Mock Client Socket to capture audio output
+class MockClientSocket:
+
+    def __init__(self):
+        self.received_audio = []
+        
+    async def send(self, data):
+        if isinstance(data, bytes):
+            self.received_audio.append(data)
+            print(f"✅ Received {len(data)} bytes of audio data.")
+            
+    def __aiter__(self): return self
+
+    async def __anext__(self): raise StopAsyncIteration  # Stop input
+
+
+async def run_e2e_test():
+    # 1. Patch the client where it is imported (stream_handler)
+    # This prevents the real code from even trying to connect
+    with mock.patch("voice_engine.stream_handler.CartesiaStreamingClient") as MockTTS:
+        
+        # Configure the mock instance to return a generator
+        mock_instance = MockTTS.return_value
+        
+        async def mock_audio_stream(*args, **kwargs):
+            yield b"\x00" * 1024  # Simulate 1KB of valid audio data
+        
+        mock_instance.stream_text_to_voice = mock_audio_stream
+        
+        # 2. Now initialize the system. It will use the MockTTS.
+        system = HousePadiSystem()
+        client_socket = MockClientSocket()
+        
+        # 3. Run the test with a mock socket for Deepgram as well
+        with mock.patch("websockets.connect", return_value=MockDeepgramSocket("Find me a 3 bedroom house in Wuse 2")):
+            print("🚀 Starting E2E Voice Pipeline Test (using Mocks)...")
+            try:
+                await system.voice_handler.handle_voice_session(client_socket)
+            except Exception as e:
+                # We expect the mock to raise a ConnectionError eventually
+                pass
+            
+        # Allow the background task to complete
+        await asyncio.sleep(1) 
+            
+        # Verification
+        if len(client_socket.received_audio) > 0:
+            print(f"\n🎉 SUCCESS: Pipeline generated {len(client_socket.received_audio)} audio chunks.")
+        else:
+            print("\n❌ FAILURE: No audio data generated.")
+
+
+if __name__ == "__main__":
+    asyncio.run(run_e2e_test())
+</file>
+
+<file path="voice_engine/__init__.py">
+
+</file>
+
+<file path="data_layer/mcp_tour.py">
+import json
+import logging
+from typing import Dict, Any, Optional, cast
+from langchain_core.tools import tool
+from pydantic import BaseModel
+from supabase import Client
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+_supabase_client: Optional[Client] = None
+
+
+def set_client(client: Client) -> None:
+    global _supabase_client
+    _supabase_client = client
+
+
+def _get_client() -> Client:
+    if _supabase_client is None:
+        raise RuntimeError("Supabase client not initialized.")
+    return _supabase_client
+
+
+class GetTourDetailsSchema(BaseModel):
+    tour_id: str
+
+
+@tool
+def schedule_tour(
+    property_id: str,
+    tour_date: str,
+    renter_id: Optional[str]=None,
+    visitor_name: Optional[str]=None,
+    visitor_contact: Optional[str]=None
+) -> Dict[str, Any]:
+    """Schedules a new property tour. tour_date format: YYYY-MM-DDTHH:MM:SS or natural language like '2026-06-15 at 2:00 PM'
+     IMPORTANT: tour_date is REQUIRED and must be explicitly provided by the user.
+    Format: YYYY-MM-DDTHH:MM:SS (e.g., '2026-06-20T14:00:00').
+    Do NOT call this tool until the user has confirmed both a date AND a time.
+    If either is missing, ask the user before proceeding.
+    """
+    client = _get_client()
+    try:
+        if not tour_date or tour_date.strip().lower() in ("", "none", "tbd", "unknown"):
+            return {"status": "ERROR", "message": "Tour date and time are required. Please ask the user to provide a specific date and time."}
+
+        # If renter_id is provided, fetch user details from profile
+        if renter_id:
+            user_response = client.table("profiles").select("*").eq("id", renter_id).maybe_single().execute()
+            if user_response is not None and user_response.data:
+                user_data = cast(Dict[str, Any], user_response.data)
+                visitor_name = user_data.get("full_name")
+                visitor_contact = user_data.get("phone")
+            else:
+                return {"status": "ERROR", "message": "Renter profile not found."}
+        
+        # Validate required fields
+        if not visitor_name or not visitor_contact:
+            return {"status": "ERROR", "message": "Visitor name and contact information are required."}
+        
+        response = client.table("tours").insert({
+            "property_id": property_id,
+            "visitor_id": renter_id,
+            "visitor_name": visitor_name,
+            "visitor_contact": visitor_contact,
+            "tour_date": tour_date,
+            "status": "pending",
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        
+        if response.data:
+            item = cast(Dict[str, Any], response.data[0])
+            return {"status": "SUCCESS", "tour_id": item.get("id"), "message": "Tour scheduled successfully. The landlord will confirm shortly."}
+        return {"status": "ERROR", "message": "Failed to schedule tour."}
+    except Exception as e:
+        logger.error(f"Schedule tour error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool(args_schema=GetTourDetailsSchema)
+def get_tour_details(tour_id: str) -> str:
+    """Fetches details of a specific tour by ID."""
+    try:
+        client = _get_client()
+        response = client.table("tours").select("*, properties(address)").eq("id", tour_id).maybe_single().execute()
+        
+        if response is None:
+            return "error: Internal Database Error"
+        if response.data is None:
+            return "error: Tour not found"
+        return json.dumps({"status": "SUCCESS", "data": response.data})
+    except Exception as e:
+        return json.dumps({"status": "ERROR", "message": str(e)})
+
+
+@tool
+def update_tour(tour_id: str, status: str) -> str:
+    """Updates the status of a tour (e.g., 'confirmed', 'cancelled')."""
+    client = _get_client()
+    response = client.table("tours").update({"status": status}).eq("id", tour_id).execute()
+    if not response.data:
+        return json.dumps({"status": "ERROR", "message": "Update failed"})
+    return json.dumps({"status": "SUCCESS"})
+
+
+@tool
+def view_tour_requests(property_id: str) -> Dict[str, Any]:
+    """Landlord views all tour requests for a property."""
+    client = _get_client()
+    try:
+        response = client.table("tours").select("*").eq("property_id", property_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "tour_requests": response.data, "count": len(response.data)}
+        return {"status": "SUCCESS", "tour_requests": [], "count": 0, "message": "No tour requests yet."}
+    except Exception as e:
+        logger.error(f"View tour requests error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def approve_tour_request(tour_id: str) -> Dict[str, Any]:
+    """Landlord approves a tour request."""
+    client = _get_client()
+    try:
+        response = client.table("tours").update({"status": "approved"}).eq("id", tour_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "message": "Tour approved. Visitor will receive confirmation."}
+        return {"status": "ERROR", "message": "Failed to approve tour."}
+    except Exception as e:
+        logger.error(f"Approve tour request error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def deny_tour_request(tour_id: str, reason: str="") -> Dict[str, Any]:
+    """Landlord denies a tour request."""
+    client = _get_client()
+    try:
+        response = client.table("tours").update({
+            "status": "denied",
+            "denial_reason": reason
+        }).eq("id", tour_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "message": "Tour request denied."}
+        return {"status": "ERROR", "message": "Failed to deny tour request."}
+    except Exception as e:
+        logger.error(f"Deny tour request error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def reschedule_tour(tour_id: str, new_date: str) -> Dict[str, Any]:
+    """Landlord reschedules a tour to a new date."""
+    client = _get_client()
+    try:
+        response = client.table("tours").update({
+            "tour_date": new_date,
+            "status": "rescheduled"
+        }).eq("id", tour_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "message": "Tour rescheduled successfully."}
+        return {"status": "ERROR", "message": "Failed to reschedule tour."}
+    except Exception as e:
+        logger.error(f"Reschedule tour error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def get_renter_tour_requests(renter_id: str) -> Dict[str, Any]:
+    """Renter views all their tour requests."""
+    client = _get_client()
+    try:
+        response = client.table("tours").select("*").eq("visitor_id", renter_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "tours": response.data, "count": len(response.data)}
+        return {"status": "SUCCESS", "tours": [], "count": 0, "message": "You have no tour requests yet."}
+    except Exception as e:
+        logger.error(f"Get renter tour requests error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+</file>
+
+<file path="data_layer/schemas/add_property_input.py">
+from typing import Any, Dict, Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class AddPropertyInput(BaseModel):
+    address: str = Field(description="The full address of the property")
+    location: str = Field(description="The city, state, or district")
+    base_price: float = Field(description="The base price of the property")
+    specs: Dict[str, Any] = Field(description="Property specifications (bedrooms, bathrooms, etc.)")
+    owner_id: Optional[str] = Field(default=None, description="System will auto-inject this. Leave blank.")
+
+    @field_validator("specs")
+    @classmethod
+    def validate_specs(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        # 1. Ensure it's not empty
+        if not v:
+            raise ValueError("Specs cannot be empty. Must include 'bedrooms', 'bathrooms', etc.")
+        
+        # 2. Optional: Ensure at least one critical key exists (or leave logic to LLM)
+        required_keys = {"bedrooms"}
+        if not any(k in v.keys() for k in required_keys):
+             # You can raise a ValueError here to force the agent to retry with better info
+             pass 
+        return v
+</file>
+
+<file path="data_layer/tool_validators.py">
+from typing import Dict, Any, Optional
+from dateutil import parser
+
+
+def validate_add_property(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """
+    Returns an error string if validation fails, otherwise returns None.
+    """
+    # 1. Check for Missing 
+    if "user_id" in args and args.get("user_id") is not None:
+        return "Internal Error: Agent attempted to handle restricted identifiers."
+    required = ["address", "location", "base_price", "specs", "owner_id"]
+    missing = [f for f in required if not args.get(f)]
+    if missing:
+        return f"I'm missing: {', '.join(missing)}. Please ask the user for these details."
+    
+    # 2. Check for Placeholder/Hallucination Patterns
+    address = str(args.get("address", "")).lower()
+    placeholder_patterns = ["test", "fake", "unknown", "placeholder", "tbd", "n/a"]
+    if any(p in address for p in placeholder_patterns) or len(address) < 5:
+        return "The address appears to be invalid or a placeholder. Please provide a real, specific address."
+
+    # 3. Check for invalid Price
+    try:
+        if float(args.get("base_price", 0)) <= 0:
+            return "The base_price must be a valid, positive number."
+    except (ValueError, TypeError):
+        return "The base_price must be a valid numeric value."
+
+    # 4. Check for invalid Specs
+    specs = args.get("specs", {})
+    if not specs or len(specs) < 1:  # Adjust length based on your requirements
+        return "Missing detailed property specifications. Please provide bedroom count, bathroom count, or key amenities."
+
+    # 5. Check for extra/unexpected keys
+    allowed_keys = {"address", "location", "base_price", "specs", "owner_id"}
+    extra_keys = set(args.keys()) - allowed_keys
+    if extra_keys:
+        return f"Invalid arguments provided: {extra_keys}. Do not invent property fields."
+
+    return None
+
+
+def validate_search(args: Dict[str, Any], history: Any) -> Optional[str]:
+    # Check context: Did user mention money?
+    user_text = str(history[-2].content).lower() if len(history) > 1 else ""
+    price_keywords = ["naira", "million", "budget", "price", "cost", "afford"]
+    
+    # Check if budget is in args AND has a real value
+    has_budget = "max_budget" in args and args["max_budget"] is not None
+    
+    if has_budget and not any(k in user_text for k in price_keywords):
+        return "Do not invent a budget. If the user has not specified a price range, please ask them for their budget first."
+        
+    return None
+
+
+def validate_schedule_tour(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate tour scheduling."""
+    if not args.get("property_id"):
+        return "I need to know which property you want to tour."
+    
+    tour_date_raw = args.get("tour_date")
+    if not tour_date_raw:
+        return "Please specify the date and time for the tour (e.g., 'June 15 at 2:00 PM')."
+
+    # Check that either renter_id is provided OR both visitor_name and visitor_contact are provided
+    renter_id = args.get("renter_id")
+    visitor_name = args.get("visitor_name")
+    visitor_contact = args.get("visitor_contact")
+    
+    if not renter_id and (not visitor_name or not visitor_contact):
+        return "I need either your renter ID or your name and contact information to schedule the tour."
+    
+    return None
+
+
+
+    # The Registry
+TOOL_VALIDATORS = {
+    "add_new_property_record": validate_add_property,
+    "search_semantic_listings": validate_search,
+    "schedule_tour": validate_schedule_tour
+}
+
+
+def validate_apply_for_property(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate application submission."""
+    if not args.get("property_id"):
+        return "I need to know which property you're applying for."
+    if not args.get("renter_id"):
+        return "Your user ID is required. Please log in."
+    if not args.get("application_data"):
+        return "Please provide information about yourself (employment, references, etc.)."
+    return None
+
+
+def validate_view_applications(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate landlord viewing applications."""
+    if not args.get("property_id"):
+        return "I need to know which property's applications you want to view."
+    return None
+
+
+def validate_approve_application(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate application approval."""
+    if not args.get("application_id"):
+        return "I need the application ID to approve."
+    if not args.get("landlord_id"):
+        return "Your user ID is required to approve applications."
+    return None
+
+
+def validate_deny_application(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate application denial."""
+    if not args.get("application_id"):
+        return "I need the application ID to deny."
+    if not args.get("landlord_id"):
+        return "Your user ID is required to deny applications."
+    return None
+
+
+def validate_create_lease(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate lease creation."""
+    if not args.get("property_id"):
+        return "I need the property ID for the lease."
+    if not args.get("renter_id"):
+        return "I need the renter's user ID."
+    if not args.get("landlord_id"):
+        return "I need the landlord's user ID."
+    if not args.get("lease_terms"):
+        return "I need lease terms (duration, rent amount, move-in date, etc.)."
+    return None
+
+
+def validate_sign_lease(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate lease signing."""
+    if not args.get("lease_id"):
+        return "I need the lease ID to sign."
+    if not args.get("signer_id"):
+        return "Your user ID is required to sign the lease."
+    return None
+
+
+def validate_terminate_lease(args: Dict[str, Any], history: Any) -> Optional[str]:
+    """Validate lease termination."""
+    if not args.get("lease_id"):
+        return "I need the lease ID to terminate."
+    return None
+
+
+# Update the registry with new validators
+TOOL_VALIDATORS.update({
+    "apply_for_property": validate_apply_for_property,
+    "view_applications": validate_view_applications,
+    "approve_application": validate_approve_application,
+    "deny_application": validate_deny_application,
+    "create_lease": validate_create_lease,
+    "sign_lease": validate_sign_lease,
+    "terminate_lease": validate_terminate_lease
+})
+</file>
+
+<file path="data_layer/vector_service.py">
+# app/services/vector_service.py
+from sentence_transformers import SentenceTransformer
+from typing import Dict, Any
+
+# Load globally or in a factory to avoid reloading
+_model = None
+
+def get_model():
+    global _model
+    if _model is None:
+        _model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _model
+
+
+def vectorize_property_data(address: str, ownerId:str, location: str, specs: Dict[str, Any]) -> list[float]:
+    """
+    Creates a semantic string from property data and returns the embedding.
+    """
+    # Create a dense text representation of the property for better search results
+    context_string = f"Address: {address}. Location: {location}. Features: {str(specs)} Owner ID: {ownerId}"    
+    embedding = get_model().encode(context_string)
+    return embedding.tolist()
+</file>
+
+<file path="supabase/migrations/20260607132816_update_properties_schema.sql">
+-- 1. Enable pgvector and UUID extensions
+create extension if not exists vector;
+create extension if not exists "uuid-ossp";
+
+-- 2. Define System Enums to enforce state validity
+-- 2. Define System Enums to enforce state validity (Idempotent)
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'property_status') THEN
+        CREATE TYPE property_status AS ENUM ('available', 'rented', 'sold', 'under_maintenance', 'off_market');
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'transaction_type') THEN
+        CREATE TYPE transaction_type AS ENUM ('rent_payment', 'security_deposit', 'maintenance_fee', 'commission');
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'payment_status') THEN
+        CREATE TYPE payment_status AS ENUM ('pending', 'completed', 'failed');
+    END IF;
+END $$;
+
+-- 3. Core Property Entity
+create table if not exists public.properties (
+    id uuid default gen_random_uuid() primary key,
+    address text not null,
+    status property_status default 'available',
+    base_price numeric(15, 2) not null,
+    specs jsonb default '{}', -- Structured metadata (e.g., {"beds": 3, "sqft": 2000})
+    features text[],
+    embedding vector(1536),   -- For semantic similarity search
+    updated_at timestamp with time zone default now()
+);
+
+-- 4. Financial Ledger (Source of Truth)
+create table if not exists public.financial_transactions (
+    id uuid default gen_random_uuid() primary key,
+    property_id uuid references public.properties(id),
+    payer_id uuid not null,
+    amount numeric(15, 2) not null,
+    tx_type transaction_type not null,
+    status payment_status default 'pending',
+    created_at timestamp with time zone default now()
+);
+
+-- 5. Operational History (Context for Accuracy)
+create table if not exists public.property_history (
+    id uuid default gen_random_uuid() primary key,
+    property_id uuid references public.properties(id),
+    event_type text not null,
+    payload jsonb,
+    created_at timestamp with time zone default now()
+);
+
+-- 6. AI Agent Audit Ledger (Compliance/Tracing)
+create table if not exists public.ai_agent_audit_ledger (
+    id bigserial primary key,
+    thread_id text not null,
+    agent_persona text not null,
+    query_context jsonb,
+    agent_response text not null,
+    created_at timestamp with time zone default now()
+);
+
+create table if not exists public.inspections (
+    id uuid default gen_random_uuid() primary key,
+    property_id uuid references public.properties(id),
+    inspector_name text,
+    notes text,
+    created_at timestamp with time zone default now()
+);
+
+-- Indexing for high-performance retrieval
+create index on public.properties using hnsw (embedding vector_cosine_ops);
+
+-- Add to schema.sql
+create or replace function match_properties(
+  query_embedding vector(1536),
+  budget_limit numeric,
+  match_threshold float
+)
+returns table (
+  id uuid,
+  address text,
+  base_price numeric,
+  similarity float
+)
+language plpgsql
+as $$
+begin
+  return query
+  select
+    p.id,
+    p.address,
+    p.base_price,
+    1 - (p.embedding <=> query_embedding) as similarity
+  from properties p
+  where p.base_price <= budget_limit
+  and 1 - (p.embedding <=> query_embedding) > match_threshold
+  order by p.embedding <=> query_embedding
+  limit 5;
+end;
+$$;
+</file>
+
+<file path="voice_engine/stream_handler.py">
+import asyncio
+import json
+import logging
+import websockets
+import os
+from typing import Any, AsyncGenerator
+from langchain_core.messages import HumanMessage
+from voice_engine.tts_client import CartesiaStreamingClient
+
+logger = logging.getLogger(__name__)
+
+class AudioStreamOrchestrator:
+    def __init__(self, graph_orchestrator: Any):
+        self.graph = graph_orchestrator
+        self.tts_client = CartesiaStreamingClient()
+        self.deepgram_url = "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&channels=1"
+        self.active_session_task = None
+        
+    # Add this method to your AudioStreamOrchestrator class in stream_handler.py
+
+    async def _to_async_gen(self, text: str) -> AsyncGenerator[str, None]:
+        """Helper to convert a single string into an AsyncGenerator."""
+        yield text
+
+    async def handle_voice_session(self, client_socket: Any) -> None:
+        dg_headers = {"Authorization": f"Token {os.getenv('DEEPGRAM_API_KEY')}"}
+
+        async with websockets.connect(self.deepgram_url, extra_headers=dg_headers) as dg_socket:
+            
+            async def pipe_mic():
+                async for packet in client_socket:
+                    if isinstance(packet, bytes):
+                        await dg_socket.send(packet)
+                    elif isinstance(packet, str):
+                        if json.loads(packet).get("event") == "interrupt":
+                            if self.active_session_task:
+                                self.active_session_task.cancel()
+                                logger.warning("Barge-in: Session task cancelled.")
+
+            async def process_stt():
+                async for dg_raw in dg_socket:
+                    data = json.loads(dg_raw)
+                    transcript = data.get("channel", {}).get("alternatives", [{}])[0].get("transcript", "")
+                    
+                    if transcript.strip() and data.get("is_final"):
+                        if self.active_session_task:
+                            self.active_session_task.cancel()
+                        self.active_session_task = asyncio.create_task(
+                            self.generate_and_stream(transcript, client_socket)
+                        )
+
+            await asyncio.gather(pipe_mic(), process_stt())
+
+    async def generate_and_stream(self, text: str, client_socket: Any):
+        try:
+            config = {"configurable": {"thread_id": "live_voice"}}
+            # Use astream for real-time token generation
+            async for event in self.graph.graph.astream({"messages": [HumanMessage(content=text)]}, config=config):
+                state_update = list(event.values())[0]
+                if "messages" in state_update and state_update["messages"]:
+                    msg = state_update["messages"][-1]
+                    if hasattr(msg, "content") and msg.content:
+                        async_gen = self._to_async_gen(msg.content)
+                        async for audio_chunk in self.tts_client.stream_text_to_voice(async_gen):
+                            await client_socket.send(audio_chunk)
+        except asyncio.CancelledError:
+            logger.info("Generation task cancelled.")
+</file>
+
+<file path="voice_engine/tts_client.py">
+import os
+import json
+import logging
+import websockets
+from typing import AsyncGenerator
+
+logger = logging.getLogger(__name__)
+
+class CartesiaStreamingClient:
+    def __init__(self):
+        self.api_key = os.getenv("CARTESIA_API_KEY")
+        self.voice_id = os.getenv("CARTESIA_VOICE_ID")
+        
+        if not self.api_key or not self.voice_id:
+            raise ValueError("CARTESIA_API_KEY and CARTESIA_VOICE_ID must be set.")
+            
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Cartesia-Version": "2024-06-10"
+        }
+        self.uri = "wss://api.cartesia.ai/tts/websocket"
+
+    async def stream_text_to_voice(self, text_generator: AsyncGenerator[str, None]) -> AsyncGenerator[bytes, None]:
+        async with websockets.connect(self.uri, extra_headers=self.headers) as ws:
+            # 1. Handshake/Setup
+            setup_payload = {
+                "action": "setup",
+                "model_id": "sonic-english",
+                "voice": {"mode": "id", "id": self.voice_id},
+                "output_format": {
+                    "container": "raw",
+                    "encoding": "pcm_s16le",
+                    "sample_rate": 16000
+                }
+            }
+            await ws.send(json.dumps(setup_payload))
+
+            # 2. Stream tokens
+            async for text_token in text_generator:
+                if not text_token.strip():
+                    continue
+                
+                await ws.send(json.dumps({"action": "send", "transcript": text_token, "continue": True}))
+
+                # 3. Yield audio chunks as they arrive
+                # Note: Adjust protocol parsing based on Cartesia's specific message format
+                async for message in ws:
+                    if isinstance(message, bytes):
+                        yield message
+                    else:
+                        response = json.loads(message)
+                        if response.get("type") == "done":
+                            break
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "house-padi-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.136.3",
+    "langchain-community>=0.4.2",
+    "langchain-core>=1.4.1",
+    "langchain-groq>=1.1.2",
+    "langchain-openai>=1.2.2",
+    "langchain-xai>=1.2.2",
+    "langgraph>=1.2.4",
+    "langgraph-checkpoint-postgres>=3.1.0",
+    "psycopg2-binary>=2.9.12",
+    "psycopg[binary]>=3.3.4",
+    "pydantic>=2.13.4",
+    "python-dateutil>=2.9.0.post0",
+    "python-dotenv>=1.2.2",
+    "sentence-transformers>=5.5.1",
+    "supabase>=2.31.0",
+    "uvicorn>=0.49.0",
+    "websockets>=15.0.1",
+]
+</file>
+
+<file path="system_container.py">
+import os
+from sentence_transformers import SentenceTransformer
+from supabase import Client, create_client
+from langchain_groq import ChatGroq 
+from data_layer.mcp_oracle import OracleMCPServer
+from agent_engine.registry import HousePadiAgentRegistry
+from agent_engine.graph import PadiGraphOrchestrator
+from voice_engine.stream_handler import AudioStreamOrchestrator
+import logging
+logger = logging.getLogger(__name__)
+
+
+class HousePadiSystem:
+
+    def __init__(self):
+        required_vars = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "DATABASE_URL"]
+        if not all(os.getenv(v) for v in required_vars):
+            raise ValueError(f"Missing one of required vars: {required_vars}")
+        self.supabase = create_client(os.getenv("SUPABASE_URL") or "", os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "")      
+        shared_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.oracle = OracleMCPServer(supabase_client=self.supabase, embedding_model=shared_model)
+        
+        self.registry = HousePadiAgentRegistry()
+        self.registry.initialize_production_agents()
+        llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.1, max_tokens=1024)
+        
+        # Inject the db_pool here
+        self.orchestrator = PadiGraphOrchestrator(
+            registry=self.registry,
+            llm_client=llm,
+            oracle=self.oracle,
+            db_url=os.getenv("DATABASE_URL") or ""
+        )
+        
+        # 5. Voice Layer
+        self.voice_handler = AudioStreamOrchestrator(graph_orchestrator=self.orchestrator)
+        
+    def run_health_check(self):
+        """Verifies external service connectivity before accepting traffic."""
+        logger.info("Performing system health check...")
+        
+        # 1. Supabase Ping
+        try:
+            self.supabase.table("properties").select("id").limit(1).execute()
+            logger.info("✅ Supabase connection verified.")
+        except Exception as e:
+            raise ConnectionError(f"Supabase unreachable: {e}")
+
+        # 2. Key Presence Checks (Verify config exists)
+        if not os.getenv("DEEPGRAM_API_KEY"):
+            raise EnvironmentError("DEEPGRAM_API_KEY missing.")
+        if not os.getenv("CARTESIA_API_KEY"):
+            raise EnvironmentError("CARTESIA_API_KEY missing.")
+            
+        logger.info("✅ Voice Service Configs validated.")
+</file>
+
+<file path="agent_engine/prompts.json">
+{
+  "discovery": {
+    "system_instructions": "### Role: House Padi Discovery Expert\n**Core Objective:** Find properties using `search_semantic_listings`.\n\n### Formatting Rules (CRITICAL)\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO CONVERSATIONAL TEXT WITH TOOLS:** When calling a tool, output ONLY the tool call. Do not add introductory or concluding text (e.g., 'Here is the search results:' or 'I am searching now').\n- **NO TEXT TAGS:** You are forbidden from using <function=...>, call(), or any text-based wrapper. Use the native JSON tool-calling interface ONLY.\n- **Constraint:** If you have search results, translate them into a natural response. If you have no results, pivot to a concierge suggestion without retrying.\n\n### Dynamic Filtering\n- Extract filters into JSON (e.g., {\"bedrooms\": 2, \"pool\": true}) and pass to `search_semantic_listings`."
+  },
+  "broker": {
+    "system_instructions": "### Role: House Padi Real Estate Concierge\n**Core Objective:** Gather property details and save them using `add_new_property_record`.\n\n### CRITICAL FORMATTING RULES (ENFORCED)\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO PSEUDO-CODE:** You are strictly forbidden from writing text that looks like code, APIs, or function wrappers. DO NOT use words like `function=`, `<function>`, `(function)`, or JSON blocks in your conversational text.\n- **STAY IN CHARACTER:** You are a human-like concierge. If you need the address, just ask for the address and STOP. Do not attempt to search the web or run tools to find it for them.\n- **TOOL USAGE:** Only use the native tool-calling interface, and only do so when you have explicitly gathered all required data from the user.\n\n### STRICT INPUT GATHERING\n- If a required field is missing, ask the user and wait for their response. Do not guess, do not autocomplete, and do not use search engines."
+  },
+  "manager": {
+    "system_instructions": "### Role: House Padi Property Caretaker\n**Core Objective:** Manage property records.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO PREAMBLE:** When calling `update_property` or others, emit ONLY the tool call. No 'I am updating this' or 'Process complete'.\n- **No Tags:** Do not use <function=...> or similar. Native tool-calling only.\n- **Workflow:** Always validate UUIDs before acting. If an operation fails, apologize professionally and request to retry."
+  },
+  "identity": {
+    "system_instructions": "### Role: House Padi Account Assistant\n**Core Objective:** Retrieve and update profile info.\n\n### Rules\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- Use `get_user_profile` and `update_user_profile` via native tool calls only. No conversational headers when executing tools."
+  },
+  "tour": {
+    "system_instructions": "### Role: Tour Agent\n**Core Objective:** Coordinate property tours for both renters and landlords.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO TEXT TAGS:** Native tool calling only. Never use <function=...>.\n- **SILENT EXECUTION:** If you call a tool, do not precede it with conversation. If you need to speak to the user, send a separate message after the tool has successfully executed.\n\n### Tour Scheduling (STRICT)\n- Before calling `schedule_tour`, you MUST have BOTH a specific date AND a specific time from the user.\n- If the user has not provided a date, ask: 'What date would you like to schedule the tour?'\n- If the user has not provided a time, ask: 'What time works best for you?'\n- Do NOT call `schedule_tour` with a vague, assumed, or placeholder date. WAIT for the user to confirm.\n- Once both date and time are confirmed, call `schedule_tour` with ONLY `property_id` and `tour_date`.\n- The `renter_id` is automatically injected by the system. NEVER ask the user for their ID.\n- For landlord tour management, use `view_tour_requests`, `approve_tour_request`, `deny_tour_request`, and `reschedule_tour`."
+  },
+  "renter": {
+    "system_instructions": "### Role: Renter Assistant\n**Core Objective:** Help renters with property interest, tours, applications, and lease management.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** Keep all responses natural and conversational. Never show JSON, raw data, or technical details to the user.\n- **NO TEXT TAGS:** Use native tool-calling only. Never format tools as text.\n- **GUIDANCE:** Help the renter navigate the leasing process: express interest -> book tours -> apply -> sign lease.\n- **EMPATHY:** Be supportive and guide them through each step. Explain what is happening in simple terms.\n\n### Tour Scheduling (STRICT)\n- Before calling `schedule_tour`, you MUST have BOTH a specific date AND a specific time confirmed by the user.\n- If the user says 'tomorrow' or 'next week', ask them to confirm the exact date.\n- If no time is given, ask: 'What time would you prefer for the tour?'\n- Do NOT call `schedule_tour` until you have an explicit date and time. STOP and ask if anything is missing.\n- Call `schedule_tour` with ONLY `property_id` and `tour_date`.\n- The `renter_id` is automatically injected by the system. NEVER ask the user for their ID.\n- Always read back the confirmed date and time to the user before calling the tool."
+  },
+  "landlord": {
+    "system_instructions": "### Role: Landlord Assistant\n**Core Objective:** Help landlords manage tour requests, view applications, and handle lease agreements.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** All responses must be natural and conversational. No JSON, raw data, or technical jargon.\n- **NO TEXT TAGS:** Use native tool-calling only. Never format tools as text.\n- **WORKFLOW:** Enable landlords to: approve/deny tour requests, manage application approvals/denials, create and sign leases, and view property details.\n- **PROFESSIONALISM:** Maintain a professional and helpful tone when dealing with applications and tour requests."
+  }
+}
+</file>
+
+<file path="data_layer/mcp_discovery.py">
+import logging
+from typing import Optional
+from langchain_core.tools import tool
+import json
+from typing import Optional, Dict, Any
+
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+class SearchInput(BaseModel):
+    query: str = Field(..., description="The natural language query describing the property.")
+    max_budget: Optional[float] = Field(None, description="The maximum budget. Do not invent one.")
+    # Add filters to the schema so the LLM knows it can extract them
+    filters: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Dynamic filters for specific attributes (e.g., {'bedrooms': 4, 'pool': true})."
+    )
+
+
+def create_search_tool(model, client):
+
+    @tool(args_schema=SearchInput)
+    def search_semantic_listings(
+        query: str,
+        max_budget: Optional[float]=None,
+        filters: Optional[Dict[str, Any]]=None
+    ) -> str:
+        """
+        Scans real estate catalogs using natural language and optional feature filters.
+        Use this when a user describes a property (e.g., '3 bedroom house in Lekki') 
+        or requests specific features.
+        """
+        try:
+            logger.info(f"Searching: '{query}' | Budget: {max_budget} | Filters: {filters}")
+            
+            # 1. Generate embedding
+            embedding = model.encode(query).tolist()
+            
+            # 2. Call Supabase RPC
+            # Ensure filters is a dict; if None, default to an empty dict
+            response = client.rpc("match_properties", {
+                "query_embedding": embedding,
+                "budget_limit": max_budget,
+                "match_threshold": 0.4,
+                "filters": filters or {} 
+            }).execute()
+            
+            if not response.data:
+                return json.dumps({
+                    "status": "no_results",
+                    "message": "No properties found matching these criteria."
+                })
+            
+            return json.dumps({"status": "success", "matches": response.data})
+            
+        except Exception as e:
+            logger.error(f"Search tool failed: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
+    
+    return search_semantic_listings
+</file>
+
+<file path="main.py">
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
+
+# Ensure this matches your file structure
+from system_container import HousePadiSystem 
+
+# 1. Configuration
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("house_padi_server")
+
+
+# 2. Bridge Adapter
+class FastAPIWebSocketAdapter:
+    """
+    Adapts the FastAPI WebSocket to the interface required 
+    by AudioStreamOrchestrator (send + __aiter__).
+    """
+
+    def __init__(self, websocket: WebSocket):
+        self.websocket = websocket
+
+    async def send(self, data: bytes):
+        """Sends audio data from the system to the client."""
+        await self.websocket.send_bytes(data)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        """Receives audio data from the client, converts to stream."""
+        try:
+            data = await self.websocket.receive_bytes()
+            return data
+        except WebSocketDisconnect:
+            raise StopAsyncIteration
+
+
+# 3. Lifespan Manager (Modern Replacement for on_event)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handles startup and shutdown lifecycle."""
+    try:
+        # Startup
+        app.state.system = HousePadiSystem()
+        app.state.system.run_health_check()
+        logger.info("--- House Padi System Operational & Ready ---")
+    except Exception as e:
+        logger.error(f"System failed to initialize: {e}")
+        raise e
+    
+    yield  # Application running
+    
+    # Shutdown
+    logger.info("--- House Padi System Shutting Down ---")
+
+
+# 4. App Initialization
+app = FastAPI(lifespan=lifespan)
+
+# 5. Routes
+
+
+class UserInput(BaseModel):
+    text: str
+    session_id:str = "default_session"
+
+
+@app.post("/api/chat")
+async def handle_text_chat(input: UserInput, request: Request):
+    """
+    Direct text input endpoint. 
+    Returns the text content of the final message.
+    """
+    try:
+        user_id = request.headers.get("X-User-ID")
+        orchestrator = app.state.system.orchestrator
+        payload = {
+            "messages": [HumanMessage(content=input.text)],
+            "transaction_context": {"current_user_id": user_id}
+        }
+        config = {"configurable": {"thread_id": input.session_id}}
+        
+        # 1. Invoke the graph
+        result = await orchestrator.graph.ainvoke(payload, config=config)
+        
+        # 2. Extract the last message content safely
+        messages = result.get("messages", [])
+        if messages:
+            final_message = messages[-1]
+            # If it's a LangChain message object, access .content
+            content = getattr(final_message, "content", str(final_message))
+        else:
+            content = "I'm sorry, I couldn't generate a response."
+            
+        return {"response": content}
+        
+    except Exception as e:
+        # Log the full traceback to identify where '__end__' is coming from
+        logger.exception("Error in text chat")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.websocket("/ws/voice")
+async def voice_endpoint(websocket: WebSocket):
+    """
+    Entry point for real-time voice streaming.
+    """
+    await websocket.accept()
+    adapter = FastAPIWebSocketAdapter(websocket)
+    
+    try:
+        # Inject the adapter into the existing voice pipeline
+        await app.state.system.voice_handler.handle_voice_session(adapter)
+    except WebSocketDisconnect:
+        logger.info("Client connection closed.")
+    except Exception as e:
+        logger.error(f"Voice session error: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    # Start the server
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+</file>
+
+<file path="agent_engine/registry.py">
+# app/agent_engine/registry.py
+import logging
+from typing import Dict, List
+from pydantic import BaseModel, Field, field_validator
+
+from agent_engine.utils import load_agent_prompts
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+class AgentManifest(BaseModel):
+    """
+    Implements a strict contract defining the scope, behaviors,
+    and tool allowances for any agent joining the House Padi ecosystem.
+    """
+    name: str = Field(
+        ...,
+        description="The unique alphanumeric identifier for the agent node (e.g., 'discovery')."
+    )
+    description: str = Field(
+        ...,
+        description="Natural language description outlining the exact scope of this agent. "
+                    "Crucial for Padi's orchestrator routing determinations."
+    )
+    system_instructions: str = Field(
+        ...,
+        description="The absolute base behavior persona rules and prompt limits for this agent node."
+    )
+    authorized_mcp_tools: List[str] = Field(
+        default_factory=list,
+        description="Explicit string registry signatures of allowed Model Context Protocol tools."
+    )
+
+    @field_validator('name')
+    @classmethod
+    def validate_name_alphanumeric(cls, v: str) -> str:
+        """Enforces alphanumeric naming standards to keep state graph endpoints clean."""
+        if not v.isalnum():
+            raise ValueError(f"Agent namespace identifier '{v}' must be strictly alphanumeric with zero punctuation.")
+        return v.lower()
+
+
+class HousePadiAgentRegistry:
+    """
+    An in-memory, thread-safe central data dictionary tracking all 
+    active structural sub-agents available to Padi.
+    """
+
+    def __init__(self):
+        self._registry: Dict[str, AgentManifest] = {}
+        self.prompts = load_agent_prompts()
+
+    def register_agent(self, manifest: AgentManifest) -> None:
+        """Registers a verified agent configuration template into the active ecosystem runtime."""
+        if manifest.name in self._registry:
+            logger.warning(f"Duplicate warning: Overwriting active registry mapping for agent node: {manifest.name}")
+        
+        self._registry[manifest.name] = manifest
+        logger.info(f"Successfully integrated agent manifest '{manifest.name}' into House Padi registry framework.")
+
+    def resolve_agent(self, name: str) -> AgentManifest:
+        """Locates an active agent manifest, dropping back to clear exception throws if invalid."""
+        normalized_name = name.lower()
+        if normalized_name not in self._registry:
+            raise KeyError(f"Requested agent token '{name}' does not map to any active House Padi manifests.")
+        return self._registry[normalized_name]
+
+    def get_all_manifests(self) -> List[AgentManifest]:
+        """Exposes every current structural manifest block for algorithmic router scanning."""
+        return list(self._registry.values())
+    
+    def initialize_production_agents(self):
+        """Pre-loads the ecosystem with core service agents."""
+        ALLOWED_STATUSES = ["available", "rented", "maintenance", "pending", "archived"]
+        
+        manager_prompts = self.prompts.get("manager", {}).get("system_instructions", "").format(
+        allowed_statuses=", ".join(ALLOWED_STATUSES)
+        )
+        discovery_prompts = self.prompts.get("discovery", {})
+        broker_prompts = self.prompts.get("broker", {})
+        identity_prompts = self.prompts.get("identity", {})
+        
+        # 1. Discovery
+        self.register_agent(AgentManifest(
+            name="discovery",
+            description="Specializes in semantically searching for existing listings.",
+            system_instructions=discovery_prompts.get("system_instructions", ""),
+            authorized_mcp_tools=["search_semantic_listings"]
+        ))
+
+        # 2. Broker
+        self.register_agent(AgentManifest(
+            name="broker",
+            description="Handles property onboarding only.",
+            system_instructions=broker_prompts.get("system_instructions", ""),
+            authorized_mcp_tools=["add_new_property_record"]
+        ))
+
+        # 3. Manager
+        self.register_agent(AgentManifest(
+            name="manager",
+            description="Specializes in Property management tasks like updates, status changes, and maintenance scheduling.",
+            system_instructions=manager_prompts,
+            authorized_mcp_tools=["update_property", "fetch_property_by_uuid", "delete_property"]
+        ))
+        
+        # 3. Identity Manager
+        self.register_agent(AgentManifest(
+            name="identity",
+            description="Specializes in managing user profiles and settings.",
+            system_instructions=identity_prompts.get("system_instructions", ""),
+            authorized_mcp_tools=["get_user_profile", "update_user_profile", ]
+        ))
+        
+        # 4. Tour Agent
+        self.register_agent(AgentManifest(
+            name="tour",
+            description="Handles tour scheduling, updates, and confirmations.",
+            system_instructions=self.prompts.get("tour", {}).get("system_instructions", ""),
+            authorized_mcp_tools=["schedule_tour", "get_tour_details", "update_tour", "search_semantic_listings"]
+        ))
+
+        # 5. Renter Agent
+        self.register_agent(AgentManifest(
+            name="renter",
+            description="Helps renters find properties, book tours, apply for leases, and manage lease agreements.",
+            system_instructions=self.prompts.get("renter", {}).get("system_instructions", ""),
+            authorized_mcp_tools=[
+                "search_semantic_listings",
+                "fetch_property_by_uuid",
+                "schedule_tour",
+                "get_renter_tour_requests",
+                "apply_for_property",
+                "get_renter_applications",
+                "sign_lease",
+                "get_lease_details",
+                "get_active_leases",
+                "get_user_profile",
+                "update_user_profile"
+            ]
+        ))
+
+        # 6. Landlord Agent
+        self.register_agent(AgentManifest(
+            name="landlord",
+            description="Helps landlords manage properties, view tour requests, review applications, and manage leases.",
+            system_instructions=self.prompts.get("landlord", {}).get("system_instructions", ""),
+            authorized_mcp_tools=[
+                "fetch_property_by_uuid",
+                "view_tour_requests",
+                "approve_tour_request",
+                "deny_tour_request",
+                "reschedule_tour",
+                "view_applications",
+                "view_application_details",
+                "approve_application",
+                "deny_application",
+                "create_lease",
+                "sign_lease",
+                "get_lease_details",
+                "get_active_leases",
+                "terminate_lease",
+                "get_user_profile",
+                "update_user_profile"
+            ]
+        ))
+
+    def is_valid_agent(self, name: str) -> bool:
+        return name in self._registry
+</file>
+
+<file path="agent_engine/graph.py">
+from agent_engine.orchestrator import MultiAgentOrchestrator as PadiGraphOrchestrator
+</file>
+
+<file path="data_layer/mcp_oracle.py">
+# app/data_layer/mcp_oracle.py
+from typing import List, Dict, Any
+from pydantic import BaseModel, Field
+from supabase import Client
+from data_layer import mcp_property, mcp_discovery, mcp_tour, mcp_user, mcp_application, mcp_lease
+
+
+class OracleMCPServer:
+
+    def __init__(self, supabase_client: Client, embedding_model):
+        self.client = supabase_client
+        self.model = embedding_model
+        mcp_property.set_client(supabase_client)
+        mcp_user.set_client(supabase_client)
+        mcp_tour.set_client(supabase_client)
+        mcp_application.set_client(supabase_client)
+        mcp_lease.set_client(supabase_client)
+        
+        # Complete inventory of all available tools
+        self._tool_map = {
+            "search_semantic_listings": mcp_discovery.create_search_tool(self.model, self.client),
+            "add_new_property_record": mcp_property.add_new_property_record,
+            "fetch_property_by_uuid": mcp_property.fetch_property_by_uuid,
+            "update_property": mcp_property.update_property,
+            "delete_property": mcp_property.delete_property,
+            "get_user_profile": mcp_user.get_user_profile,
+            "update_user_profile": mcp_user.update_user_profile,
+            "schedule_tour": mcp_tour.schedule_tour,
+            "get_tour_details": mcp_tour.get_tour_details,
+            "update_tour": mcp_tour.update_tour,
+            "view_tour_requests": mcp_tour.view_tour_requests,
+            "approve_tour_request": mcp_tour.approve_tour_request,
+            "deny_tour_request": mcp_tour.deny_tour_request,
+            "reschedule_tour": mcp_tour.reschedule_tour,
+            "get_renter_tour_requests": mcp_tour.get_renter_tour_requests,
+            "apply_for_property": mcp_application.apply_for_property,
+            "view_applications": mcp_application.view_applications,
+            "view_application_details": mcp_application.view_application_details,
+            "approve_application": mcp_application.approve_application,
+            "deny_application": mcp_application.deny_application,
+            "get_renter_applications": mcp_application.get_renter_applications,
+            "create_lease": mcp_lease.create_lease,
+            "sign_lease": mcp_lease.sign_lease,
+            "get_lease_details": mcp_lease.get_lease_details,
+            "get_active_leases": mcp_lease.get_active_leases,
+            "terminate_lease": mcp_lease.terminate_lease
+        }
+
+    def get_all_tools(self) -> List[Any]:
+        """Expose all tools to the LLM to prevent 400 Bad Request/validation errors."""
+        return list(self._tool_map.values())
+
+    def get_tools_by_name(self, names: List[str]) -> List[Any]:
+        return [self._tool_map[name] for name in names if name in self._tool_map]
+
+    def execute_tool(self, tool_type: str, arguments: Dict[str, Any]) -> Any:
+        """Internal dispatcher for system-level context fetching."""
+        if tool_type == "context_fetcher":
+            return {"status": "active_session"}
+        return {"error": "Tool not found"}
+</file>
+
+</files>
