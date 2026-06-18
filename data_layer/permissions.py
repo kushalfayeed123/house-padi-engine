@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Set
 import logging
 
+from supabase import Client
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,9 +90,9 @@ def check_permission(
     tool_name: str,
     args: Dict[str, Any],
     ctx: Dict[str, Any],
+    supabase: Client
 ) -> PermissionResult:
     user_id = ctx.get("current_user_id")
-    supabase = ctx.get("_supabase_client")
 
     # Unauthenticated access — only public tools allowed
     if not user_id:

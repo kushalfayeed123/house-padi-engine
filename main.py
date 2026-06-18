@@ -1,11 +1,13 @@
 import logging
 from contextlib import asynccontextmanager
 from typing import Literal
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
+from fastapi.security import HTTPBearer
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
+from data_layer.schemas.orchestrator_client_response import OrchestratorClientResponse
 from middleware.auth_gateway import AuthGatewayMiddleware
 from system_container import HousePadiSystem
 
@@ -44,8 +46,9 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("--- House Padi System Shutting Down ---")
 
-
-app = FastAPI(lifespan=lifespan)
+swagger_auth_scheme = HTTPBearer(auto_error=False)
+app = FastAPI(lifespan=lifespan,
+              dependencies=[Depends(swagger_auth_scheme)])
 
 app.add_middleware(
     AuthGatewayMiddleware,
@@ -105,10 +108,10 @@ async def resolve_user_context(user_id: str | None, supabase) -> dict:
         return {"current_user_id": user_id, "user_role": primary_role, "user_roles": []}
     
     
-    
 class LoginRequest(BaseModel):
     email: str
     password: str
+
 
 @app.post("/api/auth/login")
 async def login_user(body: LoginRequest):
@@ -209,7 +212,7 @@ async def update_user_role(body: RoleUpdateRequest, request: Request):
         raise HTTPException(status_code=400, detail="action must be 'grant' or 'revoke'.")
 
 
-@app.post("/api/chat")
+@app.post("/api/chat", response_model=OrchestratorClientResponse)
 async def handle_text_chat(input: UserInput, request: Request):
     """
     Text chat endpoint.
@@ -227,30 +230,15 @@ async def handle_text_chat(input: UserInput, request: Request):
         user_context = await resolve_user_context(user_id, supabase)
 
         orchestrator = app.state.system.orchestrator
-        config = {"configurable": {"thread_id": input.session_id}}
+        client_payload = await orchestrator.arun_turn(
+            user_message=input.text,
+            thread_id=input.session_id,
+            user_id=user_context.get("current_user_id"),
+            user_role=user_context.get("user_role")
+        )
 
-        # Fetch existing checkpoint state and merge so context survives multi-turn
-        existing_state = await orchestrator.graph.aget_state(config)
-        existing_ctx = {}
-        if existing_state and existing_state.values:
-            existing_ctx = existing_state.values.get("transaction_context", {}) or {}
-
-        merged_context = {
-            **existing_ctx,
-            **user_context,
-        }
-
-        payload = {
-            "messages": [HumanMessage(content=input.text)],
-            "transaction_context": merged_context,
-        }
-
-        result = await orchestrator.graph.ainvoke(payload, config=config)
-
-        messages = result.get("messages", [])
-        content = getattr(messages[-1], "content", "I'm sorry, I couldn't generate a response.") if messages else "I'm sorry, I couldn't generate a response."
-
-        return {"response": content}
+        # 4. Return clean standardized data packet directly to application client
+        return client_payload
 
     except Exception as e:
         logger.exception("Error in text chat")

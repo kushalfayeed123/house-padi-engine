@@ -92,7 +92,7 @@ class HousePadiAgentRegistry:
         # 2. Broker
         self.register_agent(AgentManifest(
             name="broker",
-            description="Handles property onboarding only.",
+            description="Strictly handles creating a new property.",
             system_instructions=broker_prompts.get("system_instructions", ""),
             authorized_mcp_tools=["add_new_property_record"]
         ))
@@ -114,20 +114,19 @@ class HousePadiAgentRegistry:
         ))
         
         # 4. Tour Agent
-        self.register_agent(AgentManifest(
-            name="tour",
-            description="Handles tour scheduling, updates, and confirmations.",
-            system_instructions=self.prompts.get("tour", {}).get("system_instructions", ""),
-            authorized_mcp_tools=["schedule_tour", "get_tour_details", "update_tour", "search_semantic_listings"]
-        ))
+        # self.register_agent(AgentManifest(
+        #     name="tour",
+        #     description="Handles tour scheduling, updates, and confirmations.",
+        #     system_instructions=self.prompts.get("tour", {}).get("system_instructions", ""),
+        #     authorized_mcp_tools=["schedule_tour", "get_tour_details", "update_tour", "search_semantic_listings"]
+        # ))
 
         # 5. Renter Agent
         self.register_agent(AgentManifest(
             name="renter",
-            description="Helps renters find properties, book tours, apply for leases, and manage lease agreements.",
+            description="Helps renters book tours, apply for properties and manage lease agreements.",
             system_instructions=self.prompts.get("renter", {}).get("system_instructions", ""),
             authorized_mcp_tools=[
-                "search_semantic_listings",
                 "fetch_property_by_uuid",
                 "schedule_tour",
                 "get_renter_tour_requests",
@@ -137,7 +136,25 @@ class HousePadiAgentRegistry:
                 "get_lease_details",
                 "get_active_leases",
                 "get_user_profile",
-                "update_user_profile"
+                "update_user_profile",
+                "view_application_details",
+            ]
+        ))
+        self.register_agent(AgentManifest(
+            name="application",
+            description="Strictly handles application creation and management.",
+            system_instructions=self.prompts.get("application", {}).get("system_instructions", ""),
+            authorized_mcp_tools=[
+                "fetch_property_by_uuid",
+                "apply_for_property",
+                "get_renter_applications",
+                "get_user_profile",
+                "view_application_details",
+                "approve_application",
+                "view_applications",
+                "deny_application",
+
+
             ]
         ))
 
@@ -152,17 +169,13 @@ class HousePadiAgentRegistry:
                 "approve_tour_request",
                 "deny_tour_request",
                 "reschedule_tour",
-                "view_applications",
-                "view_application_details",
-                "approve_application",
-                "deny_application",
                 "create_lease",
                 "sign_lease",
                 "get_lease_details",
                 "get_active_leases",
                 "terminate_lease",
                 "get_user_profile",
-                "update_user_profile"
+                "fetch_properties_by_owner"
             ]
         ))
 

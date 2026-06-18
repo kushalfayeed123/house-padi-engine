@@ -1,23 +1,24 @@
-
 import logging
-from typing import Annotated, TypedDict, List, Dict, Any, Optional
+from typing import Annotated, Hashable, TypedDict, List, Dict, Any, Optional, Literal
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, ToolMessage, HumanMessage
 from pydantic import BaseModel, Field, create_model
 from agent_engine.registry import HousePadiAgentRegistry
 from data_layer.mcp_oracle import OracleMCPServer
+from data_layer.schemas.orchestrator_client_response import OrchestratorClientResponse
 from data_layer.tool_validators import TOOL_VALIDATORS
 from data_layer.permissions import check_permission
+from supabase import Client
 
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
+
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
@@ -33,44 +34,41 @@ class PlanStep(BaseModel):
     tool_name: Optional[str] = Field(None, description="The tool to use for this step.")
     args: Dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool call.")
 
-
 # ---------------------------------------------------------------------------
 # Auto-injection map
-# Defines which tools need which field silently injected from transaction_context.
-# Format:  tool_name → { arg_name: context_key }
 # ---------------------------------------------------------------------------
+
 
 AUTO_INJECT: Dict[str, Dict[str, str]] = {
     # Property
     "add_new_property_record": {"owner_id": "current_user_id"},
 
     # Tour
-    "schedule_tour":           {"renter_id": "current_user_id"},
+    "schedule_tour": {"renter_id": "current_user_id"},
 
     # Applications
-    "apply_for_property":      {"renter_id": "current_user_id"},
+    "apply_for_property": {"renter_id": "current_user_id"},
     "get_renter_applications": {"renter_id": "current_user_id"},
-    "approve_application":     {"landlord_id": "current_user_id"},
-    "deny_application":        {"landlord_id": "current_user_id"},
+    "approve_application": {"landlord_id": "current_user_id"},
+    "deny_application": {"landlord_id": "current_user_id"},
 
     # Leases
-    "sign_lease":              {"signer_id": "current_user_id"},
-    "get_active_leases":       {"user_id": "current_user_id"},
+    "sign_lease": {"signer_id": "current_user_id"},
+    "get_active_leases": {"user_id": "current_user_id"},
 
     # User profile
-    "get_user_profile":        {"user_id": "current_user_id"},
-    "update_user_profile":     {"user_id": "current_user_id"},
+    "get_user_profile": {"user_id": "current_user_id"},
+    "update_user_profile": {"user_id": "current_user_id"},
 }
 
-# Fields the LLM should never be allowed to supply (always system-injected)
 PROTECTED_ARGS: Dict[str, set] = {
     tool: set(mapping.keys()) for tool, mapping in AUTO_INJECT.items()
 }
 
-
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
+
 
 class MultiAgentOrchestrator:
 
@@ -80,19 +78,127 @@ class MultiAgentOrchestrator:
         llm_client: Any,
         oracle: OracleMCPServer,
         db_url: str,
+        supabase_client: Client
     ):
         self.registry = registry
         self.llm = llm_client
         self.oracle = oracle
         self.db_url = db_url
+        self.supabase_client = supabase_client
 
         builder = self._build_workflow_graph()
         memory = MemorySaver()
         self.graph = builder.compile(checkpointer=memory)
+        
+    async def arun_turn(
+        self,
+        user_message: str,
+        thread_id: str,
+        user_id: Optional[str]=None,
+        user_role: Optional[str]=None
+    ) -> Dict[str, Any]:
+        """
+        Asynchronously executes a graph turn, handles state checkpoint merging, 
+        and enforces the structural client response contract. Includes a defensive
+        async throttle loop to prevent burst 429 rate limits against Groq.
+        """
+        import asyncio  # Ensure asyncio is available for throttling
+        
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        # 1. Fetch existing checkpoint state asynchronously to merge historical context
+        existing_state = await self.graph.aget_state(config)
+        existing_ctx = {}
+        if existing_state and existing_state.values:
+            existing_ctx = existing_state.values.get("transaction_context", {}) or {}
+            
+        # 2. Merge incoming secure user parameters with historical runtime data
+        merged_context = {
+            **existing_ctx,
+            "current_user_id": user_id,
+            "user_role": user_role
+        }
+
+        initial_input = {
+            "messages": [HumanMessage(content=user_message)],
+            "transaction_context": merged_context
+        }
+        
+        try:
+            # INFRASTRUCTURE DEFENSE LAYER: Smooth out high-frequency parallel requests
+            # Sleeping for 1 second gives Groq's rolling window time to clear previous token spikes.
+            logger.info("Applying dynamic rate-limiting throttle (asyncio.sleep) to absorb burst traffic...")
+            await asyncio.sleep(1.0)
+
+            # 3. Await state-graph execution path
+            final_state = await self.graph.ainvoke(initial_input, config=config)
+            
+            messages = final_state.get("messages", [])
+            current_agent = final_state.get("current_agent", "unknown")
+            tx_context = final_state.get("transaction_context", {}) or {}
+            
+            # 4. Extract natural language text payload intended for user
+            final_text = ""
+            is_handoff = (current_agent == "human_handoff")
+            
+            if messages:
+                for msg in reversed(messages):
+                    if isinstance(msg, AIMessage) and msg.content:
+                        # Ensure we extract clean display prose rather than fallback JSON configurations
+                        if isinstance(msg.content, str) and not msg.content.strip().startswith("{"):
+                            final_text = msg.content
+                            break
+                    elif isinstance(msg, SystemMessage) and "CRITICAL VIOLATION" in str(msg.content):
+                        final_text = "I encountered an issue verifying your input format. Please try again."
+                        break
+            
+            if not final_text:
+                final_text = "Your request was processed successfully, but no text was generated."
+
+            # Return uniform dictionary matching the client contract spec
+            return {
+                "success": True,
+                "agent": current_agent,
+                "message": final_text,
+                "requires_action": is_handoff,
+                "error": None,
+                "context": {
+                    "current_user_id": tx_context.get("current_user_id"),
+                    "user_role": tx_context.get("user_role")
+                }
+            }
+
+        except Exception as graph_fault:
+            logger.error(f"Fatal operational crash inside orchestrator async run loop: {graph_fault}", exc_info=True)
+            return {
+                "success": False,
+                "agent": "system_circuit_breaker",
+                "message": "An unexpected system handling error occurred. Please try again shortly.",
+                "requires_action": True,
+                "error": str(graph_fault),
+                "context": {"current_user_id": user_id, "user_role": user_role}
+            }
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _trim_historical_context(self, messages: list, max_tokens_estimate: int=2000) -> list:
+        """
+        Calculates approximate token depth working backwards to safeguard
+        against TPM/RPM limits on low-tier providers.
+        """
+        if not messages:
+            return []
+        trimmed = []
+        token_counter = 0
+        for msg in reversed(messages):
+            msg_length = len(str(msg.content).split()) * 1.4
+            if token_counter + msg_length > max_tokens_estimate:
+                break
+            trimmed.insert(0, msg)
+            token_counter += msg_length
+        return trimmed
 
     def _get_router_schema(self, agent_names: List[str]):
         return create_model(
@@ -111,34 +217,17 @@ class MultiAgentOrchestrator:
         entries = memory.get(active_agent, [])[-5:]
         return "\n".join([f"MEMORY: {entry}" for entry in entries])
 
-    def _merge_transaction_context(
-        self,
-        state: AgentState,
-        incoming: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        Fix 3 — Merges incoming context (from the HTTP request) with the
-        context already persisted in the checkpoint so that user_id and
-        user_role are never lost across graph turns.
-        """
+    def _merge_transaction_context(self, state: AgentState, incoming: Dict[str, Any]) -> Dict[str, Any]:
         existing = dict(state.get("transaction_context") or {})
-        # Incoming values win for top-level identity keys so a fresh
-        # request can always reassert who the caller is.
         for key in ("current_user_id", "user_role"):
             if incoming.get(key) is not None:
                 existing[key] = incoming[key]
-        # Merge any other keys the caller passed without wiping agent_memory
         for k, v in incoming.items():
             if k not in existing:
                 existing[k] = v
         return existing
 
-    def _update_agent_memory(
-        self,
-        state: AgentState,
-        agent_name: str,
-        message: BaseMessage,
-    ) -> Dict[str, Any]:
+    def _update_agent_memory(self, state: AgentState, agent_name: str, message: BaseMessage) -> Dict[str, Any]:
         transaction_context = dict(state.get("transaction_context", {}))
         memory = dict(transaction_context.get("agent_memory", {}))
         entry = getattr(message, "content", None)
@@ -156,7 +245,7 @@ class MultiAgentOrchestrator:
         for step in plan:
             lines.append(
                 f"{step.get('step_id')}. {step.get('description')}"
-                + (f" Use tool: {step.get('tool_name')}" if step.get("tool_name") else "")
+                +(f" Use tool: {step.get('tool_name')}" if step.get("tool_name") else "")
             )
         return "PLANNED STEPS:\n" + "\n".join(lines)
 
@@ -166,68 +255,175 @@ class MultiAgentOrchestrator:
 
     def router_node(self, state: AgentState):
         manifests = self.registry.get_all_manifests()
-        agent_names = [m.name for m in manifests]
-        active_agent = state.get("current_agent")
+        ctx = state.get("transaction_context", {}) or {}
+        user_role = ctx.get("user_role", "discovery")
 
-        agent_descriptions = "\n".join([f"- '{m.name}': {m.description}" for m in manifests])
+        # Define strict target routing maps bound directly to active roles
+        role_routing_boundaries = {
+            "renter": ["discovery", "renter"],
+            "landlord": ["discovery", "landlord"],
+            "broker": ["discovery", "renter", "landlord", "broker"]
+        }
+        allowed_destinations = role_routing_boundaries.get(user_role, ["discovery"])
+        agent_names = [m.name for m in manifests if m.name in allowed_destinations]
+        
+        active_agent = state.get("current_agent")
+        agent_descriptions = "\n".join([f"- '{m.name}': {m.description}" for m in manifests if m.name in allowed_destinations])
         memory_text = self._render_agent_memory(state)
 
         context_instruction = (
             f"\n\nCURRENT CONTEXT: The conversation is currently assigned to '{active_agent}'.\n"
             "Only stay on that agent unless the user explicitly changes the topic or asks for a different service."
-        ) if active_agent else "\n\nNo agent is currently active."
+        ) if active_agent and active_agent in allowed_destinations else "\n\nNo agent is currently active."
 
         system_instructions = (
             "You are the House Padi Orchestrator. Decide which registered agent should handle the user's latest request.\n"
-            f"Available agents:\n{agent_descriptions}\n"
+            "CRITICAL: Your response must be a valid json object with exactly one key: 'next_agent'.\n"
+            "Do not return any other keys like 'agent', 'status', 'applications', or 'request'. Use only the 'next_agent' key.\n"
+            f"Available agents for this session:\n{agent_descriptions}\n"
+            "CRITICAL RULE: If the user is providing personal details (income, employment) in response to a request "
+            "from the current agent, you MUST route to the current agent.\n"
             "- 'end': Use this if the user is done or the request has been fully satisfied."
-            + context_instruction
+            +context_instruction
         )
 
         if memory_text:
             system_instructions += "\n\n" + memory_text
 
-        dynamic_schema = self._get_router_schema(agent_names + ["end"])
-        messages = [SystemMessage(content=system_instructions)] + state["messages"]
-        decision = self.llm.with_structured_output(dynamic_schema).invoke(messages)
+        # Slice trailing conversation turns to avoid context ballooning over low-TPM router limits
+        safe_messages = self._trim_historical_context(state["messages"], max_tokens_estimate=1500)
+        messages = [SystemMessage(content=system_instructions)] + safe_messages
+        
+        messages.append(
+            SystemMessage(
+                content=(
+                    "### IMPORTANT ROUTER EXECUTION COMMAND ###\n"
+                    "Ignore any data structures, success payloads, or application logs above. "
+                    "Do not try to copy or summarize them. You must now act purely as the routing engine.\n"
+                    "Output a valid json object containing exclusively the key 'next_agent' bound to one of the allowed strings.\n"
+                    f"Allowed string values for 'next_agent': {agent_names + ['end']}\n"
+                    "Target format example: {\"next_agent\": \"end\"}"
+                )
+            )
+        )
 
-        logger.info(f"Routing decision: {decision.next_agent}")
-        return {"current_agent": decision.next_agent}
+        dynamic_schema = self._get_router_schema(agent_names + ["end"])
+        decision = self.llm.with_structured_output(dynamic_schema, method="json_mode").invoke(messages)
+
+        target_agent = decision.next_agent if decision.next_agent in (agent_names + ["end"]) else "discovery"
+        logger.info(f"Routing decision (Role Context: {user_role}): {target_agent}")
+        return {"current_agent": target_agent}
+    
+    def get_tool_definitions_prompt(self, authorized_tools: List[str]) -> str:
+        if not authorized_tools:
+            return "None. You cannot use any tools for this agent."
+            
+        tool_objects = self.oracle.get_tools_by_name(authorized_tools)
+        prompt_lines = []
+        for tool_obj in tool_objects:
+            tool_name = getattr(tool_obj, "name", "unknown")
+            args_schema = getattr(tool_obj, "args", "No arguments required.")
+            description = getattr(tool_obj, "description", "No description provided.")
+            
+            prompt_lines.append(
+                f"- Tool: '{tool_name}'\n"
+                f"  Description: {description}\n"
+                f"  Required Arguments Schema: {args_schema}"
+            )
+            
+        return "\n".join(prompt_lines)
 
     def _plan_node(self, state: AgentState) -> Dict[str, Any]:
+
         agent_name = state.get("current_agent")
-        if not agent_name:
+        if not agent_name or agent_name == "end":
             return {"agent_plan": []}
 
-        manifest = self.registry.resolve_agent(agent_name)
-        allowed_tools = ", ".join(manifest.authorized_mcp_tools) or "none"
+        # --- CRITICAL DE-DUPLICATION CHECK ---
+        # Look back at the conversation history. If a tool just finished executing,
+        # we explicitly return an empty plan so the executor knows to write a natural
+        # summary response for the user instead of calling the tool again.
+        messages = state.get("messages", [])
+        if messages:
+            last_message = messages[-1]
+            
+            # Check standard LangGraph/LangChain ToolMessage layouts
+            is_tool_msg = type(last_message).__name__ == "ToolMessage" or hasattr(last_message, "tool_call_id")
+            
+            if is_tool_msg:
+                logger.info(
+                    f"🎯 Found completed tool output at history tail. "
+                    f"Clearing plan steps to let agent '{agent_name}' compile the final prose answer."
+                )
+                return {"agent_plan": []}
+        # -------------------------------------
 
-        system_instructions = (
-            f"You are the planning agent for '{agent_name}'.\n"
-            f"Create an ordered execution plan for the user request using only the tools listed: {allowed_tools}.\n"
-            "If no tool call is required, create a single descriptive step explaining the response.\n"
-            "Output a JSON array of ordered steps with 'step_id', 'description', 'tool_name', and 'args'."
+        manifest = self.registry.resolve_agent(agent_name)
+        authorized_tools = manifest.authorized_mcp_tools
+        detailed_tools_prompt = self.get_tool_definitions_prompt(authorized_tools)
+
+        if authorized_tools:
+            ToolNameLiteral = Literal[tuple(authorized_tools)]  # type: ignore
+            tool_name_field = (Optional[ToolNameLiteral], Field(None, description="The authorized tool to use for this step."))
+        else:
+            tool_name_field = (Optional[Literal[""]], Field(None, description="No tools available for this agent. Keep null or empty."))
+
+        DynamicPlanStep = create_model(
+            "DynamicPlanStep",
+            step_id=(int, Field(..., description="The ordered step number.")),
+            description=(str, Field(..., description="What this agent should do next.")),
+            tool_name=tool_name_field,
+            args=(Dict[str, Any], Field(default_factory=dict, description="Arguments for the tool call."))
         )
 
         plan_schema = create_model(
             "AgentPlan",
-            steps=(List[PlanStep], Field(description="A sequential execution plan for the chosen agent.")),
+            steps=(List[DynamicPlanStep], Field(description="A sequential execution plan for the chosen agent.")),
         )
 
-        messages = [SystemMessage(content=system_instructions)] + state["messages"]
-        decision = self.llm.with_structured_output(plan_schema).invoke(messages)
-        return {"agent_plan": [step.model_dump() for step in decision.steps]}
+        system_instructions = (
+            f"You are the planning agent for '{agent_name}'.\n"
+            "CRITICAL: You must output a valid json object matching the schema.\n"
+            "Create an ordered execution plan for the user request.\n\n"
+            f"AVAILABLE TOOLS AND THEIR EXACT JSON SCHEMAS:\n{detailed_tools_prompt}\n\n"
+            "If no tool call is required, create a single descriptive step explaining the response.\n"
+            "Output a json object with a 'steps' array where each step contains 'step_id', 'description', 'tool_name', and 'args'.\n"
+            "CRITICAL SCHEMA RULE: The 'args' object for any tool step MUST strictly match the 'Required Arguments Schema' provided above. "
+            "Do not improvise, rename, or omit keys."
+        )
+
+        safe_messages = self._trim_historical_context(state["messages"], max_tokens_estimate=1500)
+        messages = [SystemMessage(content=system_instructions)] + safe_messages
+        messages.append(
+            SystemMessage(
+                content=(
+                    "### IMPORTANT PLANNER EXECUTION COMMAND ###\n"
+                    "Output a valid json object with a single root key 'steps' containing your execution list.\n"
+                    f"You may only choose from these specific tools: {authorized_tools or 'None'}.\n"
+                    "Target format example: {\"steps\": []}"
+                )
+            )
+        )
+
+        decision = self.llm.with_structured_output(plan_schema, method="json_mode").invoke(messages)
+        
+        sanitized_steps = []
+        for step in decision.steps:
+            step_dict = step.model_dump()
+            t_name = step_dict.get("tool_name")
+            
+            if t_name and t_name not in authorized_tools:
+                logger.warning(f"Sanitizer caught unauthorized tool hallucination '{t_name}' for agent '{agent_name}'. Stripping assignment.")
+                step_dict["tool_name"] = None
+                step_dict["args"] = {}
+                
+            sanitized_steps.append(step_dict)
+
+        return {"agent_plan": sanitized_steps}
 
     def _human_handoff_node(self, state: AgentState) -> dict:
         return {
-            "messages": [
-                AIMessage(
-                    content=(
-                        "I have reached a point where I need your guidance to proceed. "
-                        "Could you please adjust your request, clarify the details, or provide additional context?"
-                    )
-                )
-            ]
+            "current_agent": "human_handoff"
         }
 
     def _check_search_loop(self, state: AgentState) -> str:
@@ -264,65 +460,74 @@ class MultiAgentOrchestrator:
                     ]
                 }
 
-        ctx = state.get("transaction_context", {})
+            ctx = state.get("transaction_context", {})
 
-        for tool_call in last_msg.tool_calls:
-            tool_name = tool_call["name"]
-            args = tool_call.get("args", {})
+            for tool_call in last_msg.tool_calls:
+                tool_name = tool_call["name"]
+                args = tool_call.get("args", {})
 
-            # --- schema validator (existing) ---
-            validator = TOOL_VALIDATORS.get(tool_name)
-            if validator:
-                error_message = validator(args, messages)
-                if error_message:
+                validator = TOOL_VALIDATORS.get(tool_name)
+                if validator:
+                    error_message = validator(args, messages)
+                    if error_message:
+                        logger.error(f"VALIDATION FAILED for tool '{tool_name}': {error_message} | Provided Args: {args}")
+                        return {
+                            "messages": [
+                                ToolMessage(
+                                    tool_call_id=tool_call["id"],
+                                    content=f"ERROR: {error_message}",
+                                )
+                            ]
+                        }
+
+                result = check_permission(tool_name, args, ctx, supabase=self.supabase_client)
+                if not result.allowed:
+                    logger.error(f"RBAC DENIED '{tool_name}' for role='{ctx.get('user_role')}': {result.reason} | Args: {args}")
                     return {
                         "messages": [
                             ToolMessage(
                                 tool_call_id=tool_call["id"],
-                                content=f"ERROR: {error_message}",
+                                content=f"PERMISSION_DENIED: {result.reason}",
                             )
                         ]
                     }
 
-            # --- RBAC check ---
-            result = check_permission(tool_name, args, ctx)
-            if not result.allowed:
-                logger.warning(f"RBAC denied '{tool_name}' for role='{ctx.get('user_role')}': {result.reason}")
-                return {
-                    "messages": [
-                        ToolMessage(
-                            tool_call_id=tool_call["id"],
-                            content=f"PERMISSION_DENIED: {result.reason}",
-                        )
-                    ]
-                }
-
         return {}
 
     def _route_after_validation(self, state: AgentState) -> str:
+
         messages = state["messages"]
-        last_msg = messages[-1]
+        
+        # Circuit Breaker: Stop infinite error loops
         error_count = 0
         for msg in reversed(messages[-6:]):
-            if isinstance(msg, ToolMessage) and (
-                "ERROR:" in str(msg.content) or "PERMISSION_DENIED:" in str(msg.content)
-            ):
-                error_count += 1
-            elif isinstance(msg, SystemMessage) and "CRITICAL" in str(msg.content):
+            if isinstance(msg, ToolMessage) and ("ERROR:" in str(msg.content) or "PERMISSION_DENIED:" in str(msg.content)):
                 error_count += 1
         if error_count >= 2:
-            logger.error("Circuit breaker triggered: Stopping infinite LLM loop.")
+            logger.error("Circuit breaker triggered: Routing to human handoff to stop loop.")
             return "human_handoff"
 
-        if isinstance(last_msg, ToolMessage) and (
-            "ERROR:" in last_msg.content or "PERMISSION_DENIED:" in last_msg.content
-        ):
-            return f"execute_{state['current_agent']}"
+        # CRITICAL LOOP FIX: Check the last message in state
+        last_msg = messages[-1]
 
-        if isinstance(last_msg, SystemMessage) and "CRITICAL" in str(last_msg.content):
-            return f"execute_{state['current_agent']}"
+        # 1. If the last message is a ToolMessage, a tool JUST finished running.
+        # Instead of letting the graph loop forever, send the tool results back to the user!
+        if isinstance(last_msg, ToolMessage):
+            logger.info("Tool execution completed. Handing off back to the user.")
+            return "human_handoff"
 
-        return "tools"
+        # 2. If the last message is an AIMessage, check if the LLM wants to run a tool
+        if isinstance(last_msg, AIMessage):
+            if last_msg.tool_calls:
+                logger.info(f"LLM requested {len(last_msg.tool_calls)} tool call(s). Routing to tools node.")
+                return "tools"
+            else:
+                # The agent provided conversational prose or hit a dead end without tools
+                logger.info("Agent provided direct text response. Routing to human handoff.")
+                return "human_handoff"
+
+        # Fallback default
+        return "human_handoff"
 
     def _supervisor_node(self, state: AgentState) -> Dict[str, Any]:
         return {}
@@ -346,77 +551,145 @@ class MultiAgentOrchestrator:
     def _execute_agent_node(self, agent_name: str):
 
         def node(state: AgentState) -> Dict[str, Any]:
-            
             ctx = state.get("transaction_context", {})
             user_id = ctx.get("current_user_id")
             
-            # If no user_id AND agent is not 'discovery', block immediately.
             if agent_name != "discovery" and not user_id:
                 logger.warning(f"Unauthenticated access attempt blocked for agent: {agent_name}")
                 return {
                     "messages": [
-                        AIMessage(
-                            content="Authentication required. Please log in to access this feature."
-                        )
+                        AIMessage(content="Authentication required. Please log in to access this feature.")
                     ]
                 }
                 
             manifest = self.registry.resolve_agent(agent_name)
             all_tools = self.oracle.get_all_tools()
             authorized_tool_names = manifest.authorized_mcp_tools
-            ctx = state.get("transaction_context", {})
+            
+            agent_plan = state.get("agent_plan", [])
+            target_tool = None
+            if agent_plan and isinstance(agent_plan, list):
+                target_tool = agent_plan[0].get("tool_name")
+
+            # Base system policy and routing definitions stay securely at the head
             system_msg = SystemMessage(
                 content=(
-                    f"{manifest.system_instructions}\n\n"
-                    f"AVAILABLE TOOLS: {', '.join(authorized_tool_names)}.\n"
-                    f"{self._format_plan_instructions(state.get('agent_plan'))}\n"
-                    "STRICT RULE: Use only the tools listed above. Do not attempt any tool or API that is not explicitly authorized.\n"
-                    "IDENTITY RULE: Never ask the user for their ID, role, or any system identifier. "
-                    "These are injected automatically by the platform."
+                    "### CRITICAL IDENTITY POLICY ###\n"
+                    "YOU MUST NEVER ASK THE USER FOR THEIR RENTER_ID, USER_ID, OR AUTHENTICATION DETAILS.\n"
+                    "The system has automatic access to these identifiers via the secure transaction context.\n"
+                    "If a tool requires an ID, call the tool directly. The platform will automatically inject the "
+                    "required ID into the request. Do not prompt the user for data that the platform "
+                    "already possesses.\n\n"
+                    f"{manifest.system_instructions}\n"
                 )
             )
+            
+            all_tool_names = [t.name for t in all_tools]
+            for name in authorized_tool_names:
+                if name not in all_tool_names:
+                    logger.error(f"CONFIG ERROR: Agent '{agent_name}' is authorized to use '{name}', but this tool is not in the Oracle list.")
 
-            allowed_tools = [t for t in all_tools if t.name in authorized_tool_names]
-            llm_with_tools = self.llm.bind_tools(allowed_tools, tool_choice="auto")
+            allowed_tools = self.oracle.get_tools_by_name(manifest.authorized_mcp_tools)
+            
+            # Slice and trim state context backwards to fit under Groq 6,000 TPM limit limits
+            trimmed_history = self._trim_historical_context(state["messages"], max_tokens_estimate=2200)
+
+            # Build the base array execution container
+            final_invocation_messages = [system_msg] + trimmed_history
+
+            if target_tool and target_tool in authorized_tool_names:
+                logger.info(f"Forcing strict execution of planned tool: '{target_tool}'")
+                final_invocation_messages.append(
+                    SystemMessage(
+                        content=(
+                            f"CRITICAL: You are forced to execute the tool '{target_tool}'. "
+                            "Do NOT write any plain text sentences, conversational greetings, or descriptions alongside it. "
+                            "Provide ONLY the tool function parameters. Do not speak to the user yet."
+                        )
+                    )
+                )
+                llm_with_tools = self.llm.bind_tools(allowed_tools, tool_choice=target_tool)
+            else:
+                logger.info("No explicit tool planned. Falling back to autonomous routing.")
+                llm_with_tools = self.llm.bind_tools(allowed_tools, tool_choice="auto")
+                
+                # --- POSITION-BASED STRUCTURAL OVERRIDE ---
+                # If agent_plan is empty, we check if it was explicitly emptied due to a tool running.
+                if not agent_plan:
+                    final_invocation_messages.append(
+                        SystemMessage(
+                            content=(
+                                "### FINALIZING TOOL RESPONSE EXECUTIVE COMMAND ###\n"
+                                "You have successfully gathered data from the tool execution history listed above. "
+                                "Do NOT repeat or read out the default guidance or placeholder text instructions. "
+                                "Analyze the raw JSON data results provided by the ToolMessage directly above, "
+                                "and present a warm, helpful conversational summary listing the matching available options "
+                                "directly to the renter."
+                            )
+                        )
+                    )
+                else:
+                    # Fallback to normal conversational text routing
+                    plan_instructions = self._format_plan_instructions(agent_plan)
+                    final_invocation_messages.append(SystemMessage(content=plan_instructions))
+
+            logger.info(f"Invoking LLM with structured message timeline payload: {final_invocation_messages}")
 
             try:
-                response = llm_with_tools.invoke([system_msg] + state["messages"])
+                response = llm_with_tools.invoke(final_invocation_messages)
+                logger.info(f"LLM Tool Calls Found: {len(getattr(response, 'tool_calls', []))}")
 
+                processed_messages = [response]
+                
                 if response.tool_calls:
+                    new_tool_calls = []
                     for tc in response.tool_calls:
                         tool_name = tc["name"]
-
-                        # --- Fix 1, 2, 3: unified auto-injection via AUTO_INJECT map ---
+                        args_payload = dict(tc.get("args", {}))
+                        
                         injections = AUTO_INJECT.get(tool_name, {})
                         for arg_key, ctx_key in injections.items():
                             value = ctx.get(ctx_key)
                             if value is not None:
-                                tc["args"][arg_key] = value
-
-                        # Strip any protected arg the LLM hallucinated
+                                args_payload[arg_key] = value
+                        
                         protected = PROTECTED_ARGS.get(tool_name, set())
-                        tc["args"] = {
-                            k: v for k, v in tc["args"].items()
+                        args_payload = {
+                            k: v for k, v in args_payload.items()
                             if v is not None and (k not in protected or k in injections)
+                        }
+
+                        new_tc = {
+                            "name": tool_name,
+                            "args": args_payload,
+                            "id": tc.get("id"),
+                            "type": "tool_call"
                         }
 
                         if tool_name not in authorized_tool_names:
                             return {
                                 "messages": [
                                     AIMessage(
-                                        content=(
-                                            f"ERROR: You are not authorized to use '{tool_name}'. "
-                                            f"You may only use: {', '.join(authorized_tool_names)}."
-                                        )
+                                        content=f"ERROR: You are not authorized to use '{tool_name}'."
                                     )
                                 ]
                             }
+                        new_tool_calls.append(new_tc)
+
+                    sanitized_response = AIMessage(
+                        content=response.content,
+                        tool_calls=new_tool_calls,
+                        id=response.id,
+                        response_metadata=response.response_metadata
+                    )
+                    processed_messages = [sanitized_response]
 
                 new_context = self._update_agent_memory(state, agent_name, response)
+                merged_context = self._merge_transaction_context(state, new_context)
                 return {
-                    "messages": [response],
+                    "messages": processed_messages,
                     "current_agent": agent_name,
-                    "transaction_context": new_context,
+                    "transaction_context": merged_context,
                 }
 
             except Exception as e:
@@ -424,17 +697,13 @@ class MultiAgentOrchestrator:
                 return {
                     "messages": [
                         AIMessage(
-                            content=(
-                                "SYSTEM ERROR: The previous attempt to use a tool failed because the output "
-                                "was incorrectly formatted. You MUST use the provided tool-calling API. "
-                                "Do not output plain text descriptions of the tool. Call the tool directly."
-                            )
+                            content="I encountered an issue building your search profile requirements. Let's adjust slightly—could you rephrase that request?"
                         )
-                    ]
+                    ],
+                    "agent_plan": []  
                 }
 
         return node
-
     # ------------------------------------------------------------------
     # Graph wiring
     # ------------------------------------------------------------------
@@ -442,57 +711,55 @@ class MultiAgentOrchestrator:
     def _build_workflow_graph(self) -> Any:
         workflow = StateGraph(AgentState)
         workflow.add_node("router", self.router_node)
-        workflow.add_node("planner", self._plan_node)
+        workflow.add_node("planner", self._plan_node)  # Formally wired below
         workflow.add_node("validate_tools", self._validate_tool_calls)
-        workflow.add_node("tools", ToolNode(self.oracle.get_all_tools()))
-        workflow.add_node("supervisor", self._supervisor_node)
         workflow.add_node("human_handoff", self._human_handoff_node)
 
-        for manifest in self.registry.get_all_manifests():
-            workflow.add_node(f"execute_{manifest.name}", self._execute_agent_node(manifest.name))
+        manifests = self.registry.get_all_manifests()
+        for manifest in manifests:
+            node_name = f"execute_{manifest.name}"
+            workflow.add_node(node_name, self._execute_agent_node(manifest.name))
 
+        # 1. Start goes to Router to determine which agent owns the intent
         workflow.add_edge(START, "router")
 
-        def route_from_router(state: AgentState):
-            agent = state.get("current_agent")
-            return END if agent == "end" else "planner"
+        # 2. FIX: Router now routes directly to the PLANNER instead of bypassing it
+        routing_map: Dict[Hashable, str] = {m.name: "planner" for m in manifests}
+        routing_map["end"] = END
+        workflow.add_conditional_edges("router", lambda state: state.get("current_agent", "end"), routing_map)
 
-        workflow.add_conditional_edges("router", route_from_router)
-        workflow.add_conditional_edges("planner", lambda state: f"execute_{state['current_agent']}")
+        # 3. FIX: Planner routes conditionally to the selected execution agent node
+        def route_from_planner(state: AgentState) -> str:
+            agent = state.get("current_agent", "end")
+            return f"execute_{agent}" if agent != "end" else END
 
-        for manifest in self.registry.get_all_manifests():
+        planner_map: Dict[Hashable, str] = {f"execute_{m.name}": f"execute_{m.name}" for m in manifests}
+        planner_map[END] = END
+        
+        workflow.add_conditional_edges("planner", route_from_planner, planner_map)
+
+        # 4. Agent execution nodes point to validation layer
+        for manifest in manifests:
             node_name = f"execute_{manifest.name}"
+            workflow.add_edge(node_name, "validate_tools")
 
-            def create_agent_router(agent_name):
-                def route(state: AgentState):
-                    if agent_name == "discovery" and self._check_search_loop(state) == "stop_and_ask_user":
-                        return "human_handoff"
+        # 5. Validation layer routes to tools or handoff
+        workflow.add_conditional_edges(
+            "validate_tools",
+            self._route_after_validation,
+            {
+                "tools": "tools",
+                "human_handoff": "human_handoff"
+            }
+        )
 
-                    messages = state["messages"]
-                    if messages:
-                        last_msg = messages[-1]
-                        if isinstance(last_msg, AIMessage) and hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                            return "validate_tools"
-                        if isinstance(last_msg, AIMessage) and isinstance(last_msg.content, str):
-                            if "function=" in last_msg.content or "tool_call" in last_msg.content:
-                                return "validate_tools"
-                    return "supervisor"
+        # Dynamic tools node setup
+        allowed_tools = self.oracle.get_all_tools()
+        tools_node = ToolNode(allowed_tools)
+        workflow.add_node("tools", tools_node)
 
-                return route
-
-            workflow.add_conditional_edges(
-                node_name,
-                create_agent_router(manifest.name),
-                {
-                    "validate_tools": "validate_tools",
-                    "human_handoff": "human_handoff",
-                    "supervisor": "supervisor",
-                    END: END,
-                },
-            )
-
-        workflow.add_edge("tools", "supervisor")
-        workflow.add_conditional_edges("validate_tools", self._route_after_validation)
-        workflow.add_conditional_edges("supervisor", self._supervisor_route)
+        # After tools run, loop back to the planner/agent to process the tool outputs
+        workflow.add_edge("tools", "planner")
+        workflow.add_edge("human_handoff", END)
 
         return workflow

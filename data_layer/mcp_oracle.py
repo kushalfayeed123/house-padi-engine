@@ -1,15 +1,17 @@
 # app/data_layer/mcp_oracle.py
 from typing import List, Dict, Any
 from pydantic import BaseModel, Field
+from sentence_transformers import SentenceTransformer
 from supabase import Client
 from data_layer import mcp_property, mcp_discovery, mcp_tour, mcp_user, mcp_application, mcp_lease
 
 
 class OracleMCPServer:
 
-    def __init__(self, supabase_client: Client, embedding_model):
+    def __init__(self, supabase_client: Client, embedding_provider):
         self.client = supabase_client
-        self.model = embedding_model
+        self.get_embedding_model = embedding_provider
+        self.model = self.get_embedding_model() 
         mcp_property.set_client(supabase_client)
         mcp_user.set_client(supabase_client)
         mcp_tour.set_client(supabase_client)
@@ -23,6 +25,7 @@ class OracleMCPServer:
             "fetch_property_by_uuid": mcp_property.fetch_property_by_uuid,
             "update_property": mcp_property.update_property,
             "delete_property": mcp_property.delete_property,
+            "fetch_properties_by_owner": mcp_property.fetch_properties_by_owner,
             "get_user_profile": mcp_user.get_user_profile,
             "update_user_profile": mcp_user.update_user_profile,
             "schedule_tour": mcp_tour.schedule_tour,

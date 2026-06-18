@@ -5,6 +5,7 @@ from langchain_groq import ChatGroq
 from data_layer.mcp_oracle import OracleMCPServer
 from agent_engine.registry import HousePadiAgentRegistry
 from agent_engine.graph import PadiGraphOrchestrator
+from utils.model_manager import ModelManager
 from voice_engine.stream_handler import AudioStreamOrchestrator
 import logging
 logger = logging.getLogger(__name__)
@@ -17,8 +18,10 @@ class HousePadiSystem:
         if not all(os.getenv(v) for v in required_vars):
             raise ValueError(f"Missing one of required vars: {required_vars}")
         self.supabase = create_client(os.getenv("SUPABASE_URL") or "", os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "")      
-        shared_model = SentenceTransformer('all-MiniLM-L6-v2')
-        self.oracle = OracleMCPServer(supabase_client=self.supabase, embedding_model=shared_model)
+        self.oracle = OracleMCPServer(
+            supabase_client=self.supabase, 
+            embedding_provider=ModelManager.get_model 
+        )
         
         self.registry = HousePadiAgentRegistry()
         self.registry.initialize_production_agents()
@@ -29,7 +32,8 @@ class HousePadiSystem:
             registry=self.registry,
             llm_client=llm,
             oracle=self.oracle,
-            db_url=os.getenv("DATABASE_URL") or ""
+            db_url=os.getenv("DATABASE_URL") or "",
+            supabase_client=self.supabase
         )
         
         # 5. Voice Layer

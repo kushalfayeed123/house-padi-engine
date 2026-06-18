@@ -2,6 +2,13 @@ from typing import Dict, Any, Optional
 from dateutil import parser
 
 
+def check_required_args(args: Dict[str, Any], required: list[str]) -> Optional[str]:
+    missing = [field for field in required if not args.get(field)]
+    if missing:
+        return f"I am missing the following required information: {', '.join(missing)}. Please provide these details."
+    return None
+
+
 def validate_add_property(args: Dict[str, Any], history: Any) -> Optional[str]:
     """
     Returns an error string if validation fails, otherwise returns None.
@@ -10,10 +17,9 @@ def validate_add_property(args: Dict[str, Any], history: Any) -> Optional[str]:
     if "user_id" in args and args.get("user_id") is not None:
         return "Internal Error: Agent attempted to handle restricted identifiers."
     required = ["address", "location", "base_price", "specs", "owner_id"]
-    missing = [f for f in required if not args.get(f)]
-    if missing:
-        return f"I'm missing: {', '.join(missing)}. Please ask the user for these details."
-    
+    error = check_required_args(args, required)
+    if error:
+        return error
     # 2. Check for Placeholder/Hallucination Patterns
     address = str(args.get("address", "")).lower()
     placeholder_patterns = ["test", "fake", "unknown", "placeholder", "tbd", "n/a"]
@@ -75,23 +81,34 @@ def validate_schedule_tour(args: Dict[str, Any], history: Any) -> Optional[str]:
     return None
 
 
-
     # The Registry
 TOOL_VALIDATORS = {
     "add_new_property_record": validate_add_property,
     "search_semantic_listings": validate_search,
-    "schedule_tour": validate_schedule_tour
+    "schedule_tour": validate_schedule_tour,
 }
 
 
 def validate_apply_for_property(args: Dict[str, Any], history: Any) -> Optional[str]:
-    """Validate application submission."""
+    """Validate application submission, enforcing required user-provided fields."""
+    
+    # 1. Ensure primary fields exist
     if not args.get("property_id"):
         return "I need to know which property you're applying for."
+    
     if not args.get("renter_id"):
         return "Your user ID is required. Please log in."
-    if not args.get("application_data"):
-        return "Please provide information about yourself (employment, references, etc.)."
+
+    # 2. Check application_data dictionary
+    app_data = args.get("application_data")
+    if not isinstance(app_data, dict):
+        return "Please provide your application details (employment status and income range)."
+
+    # 3. Enforce specific fields
+    required = ["employment_status", "income_range"]
+    error = check_required_args(app_data, required)
+    if error:
+        return error
     return None
 
 
@@ -130,6 +147,16 @@ def validate_create_lease(args: Dict[str, Any], history: Any) -> Optional[str]:
         return "I need the landlord's user ID."
     if not args.get("lease_terms"):
         return "I need lease terms (duration, rent amount, move-in date, etc.)."
+    terms = args.get("lease_terms", {})
+    if not isinstance(terms, dict):
+        return "Lease terms must be provided as a structured object."
+        
+    required_terms = ["duration", "rent_amount", "move_in_date"]
+    missing_terms = [t for t in required_terms if not terms.get(t)]
+    
+    if missing_terms:
+        return f"I need the following lease details: {', '.join(missing_terms)}."
+    
     return None
 
 

@@ -6,6 +6,8 @@ from langchain_core.tools import tool
 from supabase import Client
 from datetime import datetime
 
+from data_layer.schemas.apply_for_property_input import ApplyForPropertyInput
+
 _supabase_client: Optional[Client] = None
 logger = logging.getLogger(__name__)
 
@@ -21,16 +23,18 @@ def _get_client() -> Client:
     return _supabase_client
 
 
-@tool
-def apply_for_property(property_id: str, renter_id: str, application_data: Dict[str, Any]) -> Dict[str, Any]:
+@tool(args_schema=ApplyForPropertyInput)
+def apply_for_property(property_id: str,  application_data: Dict[str, Any], renter_id: Optional[str]=None) -> Dict[str, Any]:
     """Renter submits an application for a property."""
     client = _get_client()
+    if not renter_id:
+        return {"status": "ERROR", "message": "Authentication required."}
     try:
         response = client.table("applications").insert({
             "property_id": property_id,
             "renter_id": renter_id,
             "status": "pending",
-            "application_data": application_data,
+            "metadata": application_data,
             "created_at": datetime.utcnow().isoformat()
         }).execute()
 
@@ -61,11 +65,20 @@ def view_applications(property_id: str) -> Dict[str, Any]:
 def view_application_details(application_id: str) -> Dict[str, Any]:
     """Get detailed information about a specific application."""
     client = _get_client()
+    
+    # Debugging check: Is the client even initialized?
+    if client is None:
+        return {"status": "ERROR", "message": "Database client not initialized."}
+
     try:
         response = client.table("applications").select("*").eq("id", application_id).maybe_single().execute()
-        if response.data:
+        
+        # Defensive check: Ensure response is not None before accessing attributes
+        if response is not None and hasattr(response, 'data') and response.data:
             return {"status": "SUCCESS", "application": response.data}
-        return {"status": "ERROR", "message": "Application not found."}
+            
+        return {"status": "ERROR", "message": "Application not found or response was empty."}
+        
     except Exception as e:
         logger.error(f"View application details error: {e}")
         return {"status": "ERROR", "message": str(e)}
@@ -91,7 +104,7 @@ def approve_application(application_id: str, landlord_id: str) -> Dict[str, Any]
 
 
 @tool
-def deny_application(application_id: str, landlord_id: str, reason: str = "") -> Dict[str, Any]:
+def deny_application(application_id: str, landlord_id: str, reason: str="") -> Dict[str, Any]:
     """Landlord denies a renter's application."""
     client = _get_client()
     try:

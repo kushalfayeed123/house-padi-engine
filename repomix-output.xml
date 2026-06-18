@@ -56,11 +56,13 @@ data_layer/mcp_oracle.py
 data_layer/mcp_property.py
 data_layer/mcp_tour.py
 data_layer/mcp_user.py
+data_layer/permissions.py
 data_layer/schemas/add_property_input.py
 data_layer/tool_validators.py
 data_layer/vector_service.py
 LEASING_FLOW.md
 main.py
+middleware/auth_gateway.py
 pyproject.toml
 README.md
 supabase/.gitignore
@@ -100,352 +102,6 @@ wheels/
 
 <file path="agent_engine/__init__.py">
 
-</file>
-
-<file path="agent_engine/orchestrator.py">
-import logging
-from typing import Annotated, TypedDict, List, Dict, Any, Optional
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, ToolMessage
-from pydantic import BaseModel, Field, create_model
-from agent_engine.registry import HousePadiAgentRegistry
-from data_layer.mcp_oracle import OracleMCPServer
-from data_layer.tool_validators import TOOL_VALIDATORS
-
-logger = logging.getLogger(__name__)
-
-
-class AgentState(TypedDict):
-    messages: Annotated[List[BaseMessage], add_messages]
-    current_agent: Optional[str]
-    transaction_context: Dict[str, Any]
-    agent_plan: Optional[List[Dict[str, Any]]]
-    search_performed: bool
-
-
-class PlanStep(BaseModel):
-    step_id: int = Field(..., description="The ordered step number.")
-    description: str = Field(..., description="What this agent should do next.")
-    tool_name: Optional[str] = Field(None, description="The tool to use for this step.")
-    args: Dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool call.")
-
-
-class MultiAgentOrchestrator:
-
-    def __init__(self, registry: HousePadiAgentRegistry, llm_client: Any, oracle: OracleMCPServer, db_url: str):
-        self.registry = registry
-        self.llm = llm_client
-        self.oracle = oracle
-        self.db_url = db_url
-
-        builder = self._build_workflow_graph()
-        memory = MemorySaver()
-        self.graph = builder.compile(checkpointer=memory)
-
-    def _get_router_schema(self, agent_names: List[str]):
-        return create_model(
-            "RouterDecision",
-            next_agent=(str, Field(description="The agent best suited to handle the request.")),
-        )
-
-    def _render_agent_memory(self, state: AgentState) -> str:
-        active_agent = state.get("current_agent")
-        transaction_context = state.get("transaction_context", {})
-        if not isinstance(transaction_context, dict):
-            transaction_context = {}
-        memory = transaction_context.get("agent_memory", {})
-        if not active_agent or not memory.get(active_agent):
-            return ""
-        entries = memory.get(active_agent, [])[-5:]
-        return "\n".join([f"MEMORY: {entry}" for entry in entries])
-
-    def router_node(self, state: AgentState):
-        manifests = self.registry.get_all_manifests()
-        agent_names = [m.name for m in manifests]
-        active_agent = state.get("current_agent")
-
-        agent_descriptions = "\n".join([f"- '{m.name}': {m.description}" for m in manifests])
-        memory_text = self._render_agent_memory(state)
-
-        context_instruction = (
-            f"\n\nCURRENT CONTEXT: The conversation is currently assigned to '{active_agent}'.\n"
-            "Only stay on that agent unless the user explicitly changes the topic or asks for a different service."
-        ) if active_agent else "\n\nNo agent is currently active."
-
-        system_instructions = (
-            "You are the House Padi Orchestrator. Decide which registered agent should handle the user's latest request.\n"
-            f"Available agents:\n{agent_descriptions}\n"
-            "- 'end': Use this if the user is done or the request has been fully satisfied." + context_instruction
-        )
-
-        if memory_text:
-            system_instructions += "\n\n" + memory_text
-
-        dynamic_schema = self._get_router_schema(agent_names + ["end"])
-        messages = [SystemMessage(content=system_instructions)] + state["messages"]
-        decision = self.llm.with_structured_output(dynamic_schema).invoke(messages)
-
-        logger.info(f"Routing decision: {decision.next_agent}")
-        return {"current_agent": decision.next_agent}
-
-    def _plan_node(self, state: AgentState) -> Dict[str, Any]:
-        agent_name = state.get("current_agent")
-        if not agent_name:
-            return {"agent_plan": []}
-
-        manifest = self.registry.resolve_agent(agent_name)
-        allowed_tools = ", ".join(manifest.authorized_mcp_tools) or "none"
-
-        system_instructions = (
-            f"You are the planning agent for '{agent_name}'.\n"
-            f"Create an ordered execution plan for the user request using only the tools listed: {allowed_tools}.\n"
-            "If no tool call is required, create a single descriptive step explaining the response.\n"
-            "Output a JSON array of ordered steps with 'step_id', 'description', 'tool_name', and 'args'."
-        )
-
-        plan_schema = create_model(
-            "AgentPlan",
-            steps=(List[PlanStep], Field(description="A sequential execution plan for the chosen agent.")),
-        )
-
-        messages = [SystemMessage(content=system_instructions)] + state["messages"]
-        decision = self.llm.with_structured_output(plan_schema).invoke(messages)
-
-        return {"agent_plan": [step.model_dump() for step in decision.steps]}
-
-    def _format_plan_instructions(self, plan: Optional[List[Dict[str, Any]]]) -> str:
-        if not plan:
-            return "The agent may proceed with a single-step response."
-
-        lines = []
-        for step in plan:
-            lines.append(f"{step.get('step_id')}. {step.get('description')}" +
-                         (f" Use tool: {step.get('tool_name')}" if step.get('tool_name') else ""))
-        return "PLANNED STEPS:\n" + "\n".join(lines)
-
-    def _update_agent_memory(self, state: AgentState, agent_name: str, message: BaseMessage) -> Dict[str, Any]:
-        transaction_context = dict(state.get("transaction_context", {}))
-        memory = dict(transaction_context.get("agent_memory", {}))
-        entry = getattr(message, "content", None)
-        if entry:
-            agent_history = list(memory.get(agent_name, []))
-            agent_history.append(entry)
-            memory[agent_name] = agent_history[-20:]
-            transaction_context["agent_memory"] = memory
-        return transaction_context
-
-    def _human_handoff_node(self, state: AgentState) -> dict:
-        return {
-            "messages": [
-                AIMessage(
-                    content=(
-                        "I have reached a point where I need your guidance to proceed. "
-                        "Could you please adjust your request, clarify the details, or provide additional context?"
-                    )
-                )
-            ]
-        }
-
-    def _check_search_loop(self, state: AgentState) -> str:
-        messages = state["messages"]
-        if len(messages) < 2:
-            return "continue"
-
-        last_msg = messages[-1]
-        second_last_msg = messages[-2]
-
-        if (isinstance(second_last_msg, ToolMessage) and "no_results" in second_last_msg.content):
-            if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
-                return "stop_and_ask_user"
-        return "continue"
-
-    def _validate_tool_calls(self, state: AgentState) -> Dict[str, Any]:
-        messages = state.get("messages", [])
-        if not messages:
-            return {}
-
-        last_msg = messages[-1]
-        if not (isinstance(last_msg, AIMessage) and last_msg.tool_calls):
-            return {}
-
-        if isinstance(last_msg, AIMessage) and isinstance(last_msg.content, str):
-            if "function=" in last_msg.content:
-                return {"messages": [SystemMessage(content=(
-                    "CRITICAL VIOLATION: You attempted to write a function call in plain text. "
-                    "You must wait for the user to reply. DO NOT invent data and DO NOT search the web. "
-                    "Just ask your question and stop generating text."
-                ))]}
-
-        for tool_call in last_msg.tool_calls:
-            tool_name = tool_call["name"]
-            args = tool_call.get("args", {})
-            validator = TOOL_VALIDATORS.get(tool_name)
-            if validator:
-                error_message = validator(args, messages)
-                if error_message:
-                    return {"messages": [ToolMessage(
-                        tool_call_id=tool_call["id"],
-                        content=f"ERROR: {error_message}"
-                    )]}
-
-        return {}
-
-    def _route_after_validation(self, state: AgentState) -> str:
-        messages = state["messages"]
-        last_msg = messages[-1]
-        error_count = 0
-        for msg in reversed(messages[-6:]):
-            if isinstance(msg, ToolMessage) and "ERROR:" in str(msg.content):
-                error_count += 1
-            elif isinstance(msg, SystemMessage) and "CRITICAL" in str(msg.content):
-                error_count += 1
-        if error_count >= 2:
-            logger.error("Circuit breaker triggered: Stopping infinite LLM loop.")
-            return "human_handoff"
-
-        if isinstance(last_msg, ToolMessage) and "ERROR:" in last_msg.content:
-            return f"execute_{state['current_agent']}"
-
-        if isinstance(last_msg, SystemMessage) and "CRITICAL" in str(last_msg.content):
-            return f"execute_{state['current_agent']}"
-
-        return "tools"
-
-    def _supervisor_node(self, state: AgentState) -> Dict[str, Any]:
-        return {}
-
-    def _supervisor_route(self, state: AgentState) -> str:
-        messages = state["messages"]
-        if not messages:
-            return END
-
-        last_msg = messages[-1]
-        if isinstance(last_msg, ToolMessage):
-            if "ERROR:" in str(last_msg.content):
-                return "human_handoff"
-            return "router"
-
-        if isinstance(last_msg, SystemMessage) and "CRITICAL" in str(last_msg.content):
-            return "human_handoff"
-
-        return END
-
-    def _execute_agent_node(self, agent_name: str):
-
-        def node(state: AgentState) -> Dict[str, Any]:
-            manifest = self.registry.resolve_agent(agent_name)
-            all_tools = self.oracle.get_all_tools()
-            authorized_tool_names = manifest.authorized_mcp_tools
-            system_msg = SystemMessage(
-                content=(
-                    f"{manifest.system_instructions}\n\n"
-                    f"AVAILABLE TOOLS: {', '.join(authorized_tool_names)}.\n"
-                    f"{self._format_plan_instructions(state.get('agent_plan'))}\n"
-                    "STRICT RULE: Use only the tools listed above. Do not attempt any tool or API that is not explicitly authorized."
-                )
-            )
-            allowed_tools = [t for t in all_tools if t.name in authorized_tool_names]
-            llm_with_tools = self.llm.bind_tools(allowed_tools, tool_choice="auto")
-            user_id = state["transaction_context"].get("current_user_id")
-
-            try:
-                response = llm_with_tools.invoke([system_msg] + state["messages"])
-
-                if response.tool_calls:
-                    for tc in response.tool_calls:
-                        if tc["name"] == "add_new_property_record" and user_id is not None:
-                            tc["args"]["owner_id"] = user_id
-                            tc["args"].pop("user_id", None)
-                        if tc["name"] == "schedule_tour" and user_id is not None:
-                            tc["args"]["renter_id"] = user_id
-                        tc["args"] = {k: v for k, v in tc["args"].items() if v is not None}
-                        if tc["name"] not in authorized_tool_names:
-                            return {"messages": [
-                                AIMessage(
-                                    content=(
-                                        f"ERROR: You are not authorized to use '{tc['name']}'. "
-                                        f"You may only use: {', '.join(authorized_tool_names)}."
-                                    )
-                                )
-                            ]}
-
-                new_context = self._update_agent_memory(state, agent_name, response)
-                return {"messages": [response], "current_agent": agent_name, "transaction_context": new_context}
-            except Exception as e:
-                logger.error(f"Execution error: {e}")
-                return {
-                    "messages": [
-                        AIMessage(content=(
-                            "SYSTEM ERROR: The previous attempt to use a tool failed because the output "
-                            "was incorrectly formatted. You MUST use the provided tool-calling API. "
-                            "Do not output plain text descriptions of the tool. Call the tool directly."
-                        ))
-                    ]
-                }
-
-        return node
-
-    def _build_workflow_graph(self) -> Any:
-        workflow = StateGraph(AgentState)
-        workflow.add_node("router", self.router_node)
-        workflow.add_node("planner", self._plan_node)
-        workflow.add_node("validate_tools", self._validate_tool_calls)
-        workflow.add_node("tools", ToolNode(self.oracle.get_all_tools()))
-        workflow.add_node("supervisor", self._supervisor_node)
-        workflow.add_node("human_handoff", self._human_handoff_node)
-
-        for manifest in self.registry.get_all_manifests():
-            workflow.add_node(f"execute_{manifest.name}", self._execute_agent_node(manifest.name))
-
-        workflow.add_edge(START, "router")
-
-        def route_from_router(state: AgentState):
-            agent = state.get("current_agent")
-            return END if agent == "end" else "planner"
-
-        workflow.add_conditional_edges("router", route_from_router)
-
-        workflow.add_conditional_edges("planner", lambda state: f"execute_{state['current_agent']}")
-
-        for manifest in self.registry.get_all_manifests():
-            node_name = f"execute_{manifest.name}"
-
-            def create_agent_router(agent_name):
-                def route(state: AgentState):
-                    if agent_name == "discovery" and self._check_search_loop(state) == "stop_and_ask_user":
-                        return "human_handoff"
-
-                    messages = state["messages"]
-                    if messages:
-                        last_msg = messages[-1]
-                        if isinstance(last_msg, AIMessage) and hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                            return "validate_tools"
-                        if isinstance(last_msg, AIMessage) and isinstance(last_msg.content, str):
-                            if "function=" in last_msg.content or "tool_call" in last_msg.content:
-                                return "validate_tools"
-                    return "supervisor"
-
-                return route
-
-            workflow.add_conditional_edges(
-                node_name,
-                create_agent_router(manifest.name),
-                {
-                    "validate_tools": "validate_tools",
-                    "human_handoff": "human_handoff",
-                    "supervisor": "supervisor",
-                    END: END,
-                }
-            )
-
-        workflow.add_edge("tools", "supervisor")
-        workflow.add_conditional_edges("validate_tools", self._route_after_validation)
-        workflow.add_conditional_edges("supervisor", self._supervisor_route)
-
-        return workflow
 </file>
 
 <file path="agent_engine/utils.py">
@@ -495,7 +151,7 @@ def apply_for_property(property_id: str, renter_id: str, application_data: Dict[
             "property_id": property_id,
             "renter_id": renter_id,
             "status": "pending",
-            "application_data": application_data,
+            "metadata": application_data,
             "created_at": datetime.utcnow().isoformat()
         }).execute()
 
@@ -526,11 +182,20 @@ def view_applications(property_id: str) -> Dict[str, Any]:
 def view_application_details(application_id: str) -> Dict[str, Any]:
     """Get detailed information about a specific application."""
     client = _get_client()
+    
+    # Debugging check: Is the client even initialized?
+    if client is None:
+        return {"status": "ERROR", "message": "Database client not initialized."}
+
     try:
         response = client.table("applications").select("*").eq("id", application_id).maybe_single().execute()
-        if response.data:
+        
+        # Defensive check: Ensure response is not None before accessing attributes
+        if response is not None and hasattr(response, 'data') and response.data:
             return {"status": "SUCCESS", "application": response.data}
-        return {"status": "ERROR", "message": "Application not found."}
+            
+        return {"status": "ERROR", "message": "Application not found or response was empty."}
+        
     except Exception as e:
         logger.error(f"View application details error: {e}")
         return {"status": "ERROR", "message": str(e)}
@@ -556,7 +221,7 @@ def approve_application(application_id: str, landlord_id: str) -> Dict[str, Any]
 
 
 @tool
-def deny_application(application_id: str, landlord_id: str, reason: str = "") -> Dict[str, Any]:
+def deny_application(application_id: str, landlord_id: str, reason: str="") -> Dict[str, Any]:
     """Landlord denies a renter's application."""
     client = _get_client()
     try:
@@ -912,6 +577,151 @@ def update_user_profile(updates: Dict[str, Any], user_id: Optional[str] = None) 
         return json.dumps({"status": "success", "data": response.data})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
+</file>
+
+<file path="data_layer/permissions.py">
+# data_layer/permissions.py
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Optional, Set
+import logging
+
+from supabase import Client
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PermissionResult:
+    allowed: bool
+    reason: str = ""
+
+    @staticmethod
+    def ok() -> "PermissionResult":
+        return PermissionResult(allowed=True)
+
+    @staticmethod
+    def denied(reason: str) -> "PermissionResult":
+        return PermissionResult(allowed=False, reason=reason)
+
+# ---------------------------------------------------------------------------
+# Ownership rules — unchanged, still code-side checks
+# ---------------------------------------------------------------------------
+
+
+OwnershipRule = Callable[[Dict[str, Any], Dict[str, Any]], bool]
+
+
+def _owns_property(args, ctx):
+    supabase = ctx.get("_supabase_client")
+    if not supabase: return True
+    try:
+        resp = supabase.table("properties").select("owner_id").eq("id", args.get("property_id", "")).maybe_single().execute()
+        if resp and resp.data:
+            return resp.data.get("owner_id") == ctx.get("current_user_id")
+    except Exception:
+        pass
+    return False
+
+
+def _owns_tour(args, ctx):
+    supabase = ctx.get("_supabase_client")
+    if not supabase: return True
+    try:
+        resp = supabase.table("tours").select("properties(owner_id)").eq("id", args.get("tour_id", "")).maybe_single().execute()
+        if resp and resp.data:
+            return (resp.data.get("properties") or {}).get("owner_id") == ctx.get("current_user_id")
+    except Exception:
+        pass
+    return False
+
+
+def _owns_application(args, ctx):
+    supabase = ctx.get("_supabase_client")
+    if not supabase: return True
+    try:
+        resp = supabase.table("applications").select("properties(owner_id)").eq("id", args.get("application_id", "")).maybe_single().execute()
+        if resp and resp.data:
+            return (resp.data.get("properties") or {}).get("owner_id") == ctx.get("current_user_id")
+    except Exception:
+        pass
+    return False
+
+
+OWNERSHIP_RULES: Dict[str, OwnershipRule] = {
+    "update_property": _owns_property,
+    "delete_property": _owns_property,
+    "view_tour_requests": _owns_tour,
+    "approve_tour_request": _owns_tour,
+    "deny_tour_request": _owns_tour,
+    "reschedule_tour": _owns_tour,
+    "approve_application": _owns_application,
+    "deny_application": _owns_application,
+}
+
+# ---------------------------------------------------------------------------
+# Permission check — now hits the materialized view
+# ---------------------------------------------------------------------------
+
+# Tools that are openly accessible without authentication
+PUBLIC_TOOLS = {"search_semantic_listings"}
+
+
+def check_permission(
+    tool_name: str,
+    args: Dict[str, Any],
+    ctx: Dict[str, Any],
+    supabase: Client
+) -> PermissionResult:
+    user_id = ctx.get("current_user_id")
+
+    # Unauthenticated access — only public tools allowed
+    if not user_id:
+        if tool_name in PUBLIC_TOOLS:
+            return PermissionResult.ok()
+        return PermissionResult.denied(
+            f"You must be logged in to use '{tool_name}'."
+        )
+
+    if not supabase:
+        return PermissionResult.denied("No database client available for permission check.")
+
+    # Authenticated — check materialized view
+    try:
+        resp = (
+            supabase.table("user_permissions")
+            .select("permission")
+            .eq("user_id", user_id)
+            .eq("permission", tool_name)
+            .maybe_single()
+            .execute()
+        )
+        has_permission = resp is not None and resp.data is not None
+    except Exception as e:
+        logger.error(f"Permission lookup failed for tool='{tool_name}' user='{user_id}': {e}")
+        return PermissionResult.denied("Permission check failed. Please try again.")
+
+    if not has_permission:
+        return PermissionResult.denied(
+            f"You do not have permission to perform '{tool_name}'. "
+            "Contact support if you believe this is an error."
+        )
+
+    # Ownership check
+    ownership_rule = OWNERSHIP_RULES.get(tool_name)
+    if ownership_rule:
+        try:
+            if not ownership_rule(args, ctx):
+                return PermissionResult.denied(
+                    f"Access denied: you do not own the resource targeted by '{tool_name}'."
+                )
+        except Exception:
+            return PermissionResult.denied(
+                f"Could not verify ownership for '{tool_name}'. Access denied."
+            )
+
+    return PermissionResult.ok()
 </file>
 
 <file path="LEASING_FLOW.md">
@@ -1319,6 +1129,74 @@ Search completed. Call schedule_tour with property_id and tour_date.
 3. Test landlord workflow end-to-end
 4. Verify human-readable responses (no JSON output)
 5. Document any edge cases or improvements
+</file>
+
+<file path="middleware/auth_gateway.py">
+# middleware/auth_gateway.py
+# Add this to your existing FastAPI app — no separate service needed
+
+import os
+from fastapi import Request, HTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from starlette.requests import Request
+
+
+# Routes that don't require authentication
+# Updated routes
+STRICT_PUBLIC_ROUTES = {
+    "/api/auth/register",
+    "/api/auth/login",
+    "/docs",
+    "/openapi.json",
+}
+
+OPTIONAL_AUTH_ROUTES = {
+    "/api/chat",
+}
+
+
+class AuthGatewayMiddleware(BaseHTTPMiddleware):
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        
+        # 1. Strictly Public: Ignore auth entirely
+        if path in STRICT_PUBLIC_ROUTES:
+            return await call_next(request)
+
+        # 2. Extract header with explicit typing
+        auth_header: str | None = request.headers.get("Authorization")
+
+        # 3. Handle Optional Auth (e.g., /api/chat)
+        if path in OPTIONAL_AUTH_ROUTES and auth_header is None:
+            return await call_next(request)  # Guest access allowed
+
+        # 4. Mandatory Auth Check (either required route or provided header)
+        if not auth_header:
+            raise HTTPException(status_code=401, detail="Authentication required.")
+
+        # 5. Format Validation
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Invalid authorization format. Must be Bearer token.")
+
+        token = auth_header.split(" ")[1] 
+        
+        # 6. Verification
+        try:
+            supabase_client = request.app.state.system.supabase
+            user_response = supabase_client.auth.get_user(token)
+            
+            if not user_response or not user_response.user:
+                raise HTTPException(status_code=401, detail="Invalid or expired token.")
+
+            request.state.user_id = user_response.user.id
+            
+        except Exception as e:
+            # Differentiate between Auth failure and internal errors if needed
+            raise HTTPException(status_code=401, detail="Authentication failed.")
+
+        return await call_next(request)
 </file>
 
 <file path="README.md">
@@ -2020,187 +1898,513 @@ if __name__ == "__main__":
 
 </file>
 
-<file path="data_layer/mcp_tour.py">
-import json
+<file path="agent_engine/orchestrator.py">
 import logging
-from typing import Dict, Any, Optional, cast
-from langchain_core.tools import tool
-from pydantic import BaseModel
+from typing import Annotated, TypedDict, List, Dict, Any, Optional
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, ToolMessage
+from pydantic import BaseModel, Field, create_model
+from agent_engine.registry import HousePadiAgentRegistry
+from data_layer.mcp_oracle import OracleMCPServer
+from data_layer.tool_validators import TOOL_VALIDATORS
+from data_layer.permissions import check_permission
 from supabase import Client
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-_supabase_client: Optional[Client] = None
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
 
-def set_client(client: Client) -> None:
-    global _supabase_client
-    _supabase_client = client
+class AgentState(TypedDict):
+    messages: Annotated[List[BaseMessage], add_messages]
+    current_agent: Optional[str]
+    transaction_context: Dict[str, Any]
+    agent_plan: Optional[List[Dict[str, Any]]]
+    search_performed: bool
 
 
-def _get_client() -> Client:
-    if _supabase_client is None:
-        raise RuntimeError("Supabase client not initialized.")
-    return _supabase_client
+class PlanStep(BaseModel):
+    step_id: int = Field(..., description="The ordered step number.")
+    description: str = Field(..., description="What this agent should do next.")
+    tool_name: Optional[str] = Field(None, description="The tool to use for this step.")
+    args: Dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool call.")
+
+# ---------------------------------------------------------------------------
+# Auto-injection map
+# Defines which tools need which field silently injected from transaction_context.
+# Format:  tool_name → { arg_name: context_key }
+# ---------------------------------------------------------------------------
 
 
-class GetTourDetailsSchema(BaseModel):
-    tour_id: str
+AUTO_INJECT: Dict[str, Dict[str, str]] = {
+    # Property
+    "add_new_property_record": {"owner_id": "current_user_id"},
+
+    # Tour
+    "schedule_tour": {"renter_id": "current_user_id"},
+
+    # Applications
+    "apply_for_property": {"renter_id": "current_user_id"},
+    "get_renter_applications": {"renter_id": "current_user_id"},
+    "approve_application": {"landlord_id": "current_user_id"},
+    "deny_application": {"landlord_id": "current_user_id"},
+
+    # Leases
+    "sign_lease": {"signer_id": "current_user_id"},
+    "get_active_leases": {"user_id": "current_user_id"},
+
+    # User profile
+    "get_user_profile": {"user_id": "current_user_id"},
+    "update_user_profile": {"user_id": "current_user_id"},
+}
+
+# Fields the LLM should never be allowed to supply (always system-injected)
+PROTECTED_ARGS: Dict[str, set] = {
+    tool: set(mapping.keys()) for tool, mapping in AUTO_INJECT.items()
+}
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 
 
-@tool
-def schedule_tour(
-    property_id: str,
-    tour_date: str,
-    renter_id: Optional[str]=None,
-    visitor_name: Optional[str]=None,
-    visitor_contact: Optional[str]=None
-) -> Dict[str, Any]:
-    """Schedules a new property tour. tour_date format: YYYY-MM-DDTHH:MM:SS or natural language like '2026-06-15 at 2:00 PM'
-     IMPORTANT: tour_date is REQUIRED and must be explicitly provided by the user.
-    Format: YYYY-MM-DDTHH:MM:SS (e.g., '2026-06-20T14:00:00').
-    Do NOT call this tool until the user has confirmed both a date AND a time.
-    If either is missing, ask the user before proceeding.
-    """
-    client = _get_client()
-    try:
-        if not tour_date or tour_date.strip().lower() in ("", "none", "tbd", "unknown"):
-            return {"status": "ERROR", "message": "Tour date and time are required. Please ask the user to provide a specific date and time."}
+class MultiAgentOrchestrator:
 
-        # If renter_id is provided, fetch user details from profile
-        if renter_id:
-            user_response = client.table("profiles").select("*").eq("id", renter_id).maybe_single().execute()
-            if user_response is not None and user_response.data:
-                user_data = cast(Dict[str, Any], user_response.data)
-                visitor_name = user_data.get("full_name")
-                visitor_contact = user_data.get("phone")
-            else:
-                return {"status": "ERROR", "message": "Renter profile not found."}
-        
-        # Validate required fields
-        if not visitor_name or not visitor_contact:
-            return {"status": "ERROR", "message": "Visitor name and contact information are required."}
-        
-        response = client.table("tours").insert({
-            "property_id": property_id,
-            "visitor_id": renter_id,
-            "visitor_name": visitor_name,
-            "visitor_contact": visitor_contact,
-            "tour_date": tour_date,
-            "status": "pending",
-            "created_at": datetime.utcnow().isoformat()
-        }).execute()
-        
-        if response.data:
-            item = cast(Dict[str, Any], response.data[0])
-            return {"status": "SUCCESS", "tour_id": item.get("id"), "message": "Tour scheduled successfully. The landlord will confirm shortly."}
-        return {"status": "ERROR", "message": "Failed to schedule tour."}
-    except Exception as e:
-        logger.error(f"Schedule tour error: {e}")
-        return {"status": "ERROR", "message": str(e)}
+    def __init__(
+        self,
+        registry: HousePadiAgentRegistry,
+        llm_client: Any,
+        oracle: OracleMCPServer,
+        db_url: str,
+        supabase_client: Client
+    ):
+        self.registry = registry
+        self.llm = llm_client
+        self.oracle = oracle
+        self.db_url = db_url
+        self.supabase_client = supabase_client
 
+        builder = self._build_workflow_graph()
+        memory = MemorySaver()
+        self.graph = builder.compile(checkpointer=memory)
 
-@tool(args_schema=GetTourDetailsSchema)
-def get_tour_details(tour_id: str) -> str:
-    """Fetches details of a specific tour by ID."""
-    try:
-        client = _get_client()
-        response = client.table("tours").select("*, properties(address)").eq("id", tour_id).maybe_single().execute()
-        
-        if response is None:
-            return "error: Internal Database Error"
-        if response.data is None:
-            return "error: Tour not found"
-        return json.dumps({"status": "SUCCESS", "data": response.data})
-    except Exception as e:
-        return json.dumps({"status": "ERROR", "message": str(e)})
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
+    def _get_router_schema(self, agent_names: List[str]):
+        return create_model(
+            "RouterDecision",
+            next_agent=(str, Field(description="The agent best suited to handle the request.")),
+        )
 
-@tool
-def update_tour(tour_id: str, status: str) -> str:
-    """Updates the status of a tour (e.g., 'confirmed', 'cancelled')."""
-    client = _get_client()
-    response = client.table("tours").update({"status": status}).eq("id", tour_id).execute()
-    if not response.data:
-        return json.dumps({"status": "ERROR", "message": "Update failed"})
-    return json.dumps({"status": "SUCCESS"})
+    def _render_agent_memory(self, state: AgentState) -> str:
+        active_agent = state.get("current_agent")
+        transaction_context = state.get("transaction_context", {})
+        if not isinstance(transaction_context, dict):
+            transaction_context = {}
+        memory = transaction_context.get("agent_memory", {})
+        if not active_agent or not memory.get(active_agent):
+            return ""
+        entries = memory.get(active_agent, [])[-5:]
+        return "\n".join([f"MEMORY: {entry}" for entry in entries])
 
+    def _merge_transaction_context(
+        self,
+        state: AgentState,
+        incoming: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Fix 3 — Merges incoming context (from the HTTP request) with the
+        context already persisted in the checkpoint so that user_id and
+        user_role are never lost across graph turns.
+        """
+        existing = dict(state.get("transaction_context") or {})
+        # Incoming values win for top-level identity keys so a fresh
+        # request can always reassert who the caller is.
+        for key in ("current_user_id", "user_role"):
+            if incoming.get(key) is not None:
+                existing[key] = incoming[key]
+        # Merge any other keys the caller passed without wiping agent_memory
+        for k, v in incoming.items():
+            if k not in existing:
+                existing[k] = v
+        return existing
 
-@tool
-def view_tour_requests(property_id: str) -> Dict[str, Any]:
-    """Landlord views all tour requests for a property."""
-    client = _get_client()
-    try:
-        response = client.table("tours").select("*").eq("property_id", property_id).execute()
-        if response.data:
-            return {"status": "SUCCESS", "tour_requests": response.data, "count": len(response.data)}
-        return {"status": "SUCCESS", "tour_requests": [], "count": 0, "message": "No tour requests yet."}
-    except Exception as e:
-        logger.error(f"View tour requests error: {e}")
-        return {"status": "ERROR", "message": str(e)}
+    def _update_agent_memory(
+        self,
+        state: AgentState,
+        agent_name: str,
+        message: BaseMessage,
+    ) -> Dict[str, Any]:
+        transaction_context = dict(state.get("transaction_context", {}))
+        memory = dict(transaction_context.get("agent_memory", {}))
+        entry = getattr(message, "content", None)
+        if entry:
+            agent_history = list(memory.get(agent_name, []))
+            agent_history.append(entry)
+            memory[agent_name] = agent_history[-20:]
+            transaction_context["agent_memory"] = memory
+        return transaction_context
 
+    def _format_plan_instructions(self, plan: Optional[List[Dict[str, Any]]]) -> str:
+        if not plan:
+            return "The agent may proceed with a single-step response."
+        lines = []
+        for step in plan:
+            lines.append(
+                f"{step.get('step_id')}. {step.get('description')}"
+                +(f" Use tool: {step.get('tool_name')}" if step.get("tool_name") else "")
+            )
+        return "PLANNED STEPS:\n" + "\n".join(lines)
 
-@tool
-def approve_tour_request(tour_id: str) -> Dict[str, Any]:
-    """Landlord approves a tour request."""
-    client = _get_client()
-    try:
-        response = client.table("tours").update({"status": "approved"}).eq("id", tour_id).execute()
-        if response.data:
-            return {"status": "SUCCESS", "message": "Tour approved. Visitor will receive confirmation."}
-        return {"status": "ERROR", "message": "Failed to approve tour."}
-    except Exception as e:
-        logger.error(f"Approve tour request error: {e}")
-        return {"status": "ERROR", "message": str(e)}
+    # ------------------------------------------------------------------
+    # Nodes
+    # ------------------------------------------------------------------
 
+    def router_node(self, state: AgentState):
+        manifests = self.registry.get_all_manifests()
+        agent_names = [m.name for m in manifests]
+        active_agent = state.get("current_agent")
 
-@tool
-def deny_tour_request(tour_id: str, reason: str="") -> Dict[str, Any]:
-    """Landlord denies a tour request."""
-    client = _get_client()
-    try:
-        response = client.table("tours").update({
-            "status": "denied",
-            "denial_reason": reason
-        }).eq("id", tour_id).execute()
-        if response.data:
-            return {"status": "SUCCESS", "message": "Tour request denied."}
-        return {"status": "ERROR", "message": "Failed to deny tour request."}
-    except Exception as e:
-        logger.error(f"Deny tour request error: {e}")
-        return {"status": "ERROR", "message": str(e)}
+        agent_descriptions = "\n".join([f"- '{m.name}': {m.description}" for m in manifests])
+        memory_text = self._render_agent_memory(state)
 
+        context_instruction = (
+            f"\n\nCURRENT CONTEXT: The conversation is currently assigned to '{active_agent}'.\n"
+            "Only stay on that agent unless the user explicitly changes the topic or asks for a different service."
+        ) if active_agent else "\n\nNo agent is currently active."
 
-@tool
-def reschedule_tour(tour_id: str, new_date: str) -> Dict[str, Any]:
-    """Landlord reschedules a tour to a new date."""
-    client = _get_client()
-    try:
-        response = client.table("tours").update({
-            "tour_date": new_date,
-            "status": "rescheduled"
-        }).eq("id", tour_id).execute()
-        if response.data:
-            return {"status": "SUCCESS", "message": "Tour rescheduled successfully."}
-        return {"status": "ERROR", "message": "Failed to reschedule tour."}
-    except Exception as e:
-        logger.error(f"Reschedule tour error: {e}")
-        return {"status": "ERROR", "message": str(e)}
+        system_instructions = (
+            "You are the House Padi Orchestrator. Decide which registered agent should handle the user's latest request.\n"
+            f"Available agents:\n{agent_descriptions}\n"
+            "- 'end': Use this if the user is done or the request has been fully satisfied."
+            +context_instruction
+        )
 
+        if memory_text:
+            system_instructions += "\n\n" + memory_text
 
-@tool
-def get_renter_tour_requests(renter_id: str) -> Dict[str, Any]:
-    """Renter views all their tour requests."""
-    client = _get_client()
-    try:
-        response = client.table("tours").select("*").eq("visitor_id", renter_id).execute()
-        if response.data:
-            return {"status": "SUCCESS", "tours": response.data, "count": len(response.data)}
-        return {"status": "SUCCESS", "tours": [], "count": 0, "message": "You have no tour requests yet."}
-    except Exception as e:
-        logger.error(f"Get renter tour requests error: {e}")
-        return {"status": "ERROR", "message": str(e)}
+        dynamic_schema = self._get_router_schema(agent_names + ["end"])
+        messages = [SystemMessage(content=system_instructions)] + state["messages"]
+        decision = self.llm.with_structured_output(dynamic_schema).invoke(messages)
+
+        logger.info(f"Routing decision: {decision.next_agent}")
+        return {"current_agent": decision.next_agent}
+
+    def _plan_node(self, state: AgentState) -> Dict[str, Any]:
+        agent_name = state.get("current_agent")
+        if not agent_name:
+            return {"agent_plan": []}
+
+        manifest = self.registry.resolve_agent(agent_name)
+        allowed_tools = ", ".join(manifest.authorized_mcp_tools) or "none"
+
+        system_instructions = (
+            f"You are the planning agent for '{agent_name}'.\n"
+            f"Create an ordered execution plan for the user request using only the tools listed: {allowed_tools}.\n"
+            "If no tool call is required, create a single descriptive step explaining the response.\n"
+            "Output a JSON array of ordered steps with 'step_id', 'description', 'tool_name', and 'args'."
+        )
+
+        plan_schema = create_model(
+            "AgentPlan",
+            steps=(List[PlanStep], Field(description="A sequential execution plan for the chosen agent.")),
+        )
+
+        messages = [SystemMessage(content=system_instructions)] + state["messages"]
+        decision = self.llm.with_structured_output(plan_schema).invoke(messages)
+        return {"agent_plan": [step.model_dump() for step in decision.steps]}
+
+    def _human_handoff_node(self, state: AgentState) -> dict:
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "I have reached a point where I need your guidance to proceed. "
+                        "Could you please adjust your request, clarify the details, or provide additional context?"
+                    )
+                )
+            ]
+        }
+
+    def _check_search_loop(self, state: AgentState) -> str:
+        messages = state["messages"]
+        if len(messages) < 2:
+            return "continue"
+        last_msg = messages[-1]
+        second_last_msg = messages[-2]
+        if isinstance(second_last_msg, ToolMessage) and "no_results" in second_last_msg.content:
+            if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+                return "stop_and_ask_user"
+        return "continue"
+
+    def _validate_tool_calls(self, state: AgentState) -> Dict[str, Any]:
+        messages = state.get("messages", [])
+        if not messages:
+            return {}
+
+        last_msg = messages[-1]
+        if not (isinstance(last_msg, AIMessage) and last_msg.tool_calls):
+            return {}
+
+        if isinstance(last_msg, AIMessage) and isinstance(last_msg.content, str):
+            if "function=" in last_msg.content:
+                return {
+                    "messages": [
+                        SystemMessage(
+                            content=(
+                                "CRITICAL VIOLATION: You attempted to write a function call in plain text. "
+                                "You must wait for the user to reply. DO NOT invent data and DO NOT search the web. "
+                                "Just ask your question and stop generating text."
+                            )
+                        )
+                    ]
+                }
+
+        ctx = state.get("transaction_context", {})
+
+        for tool_call in last_msg.tool_calls:
+            tool_name = tool_call["name"]
+            args = tool_call.get("args", {})
+
+            # --- schema validator (existing) ---
+            validator = TOOL_VALIDATORS.get(tool_name)
+            if validator:
+                error_message = validator(args, messages)
+                if error_message:
+                    return {
+                        "messages": [
+                            ToolMessage(
+                                tool_call_id=tool_call["id"],
+                                content=f"ERROR: {error_message}",
+                            )
+                        ]
+                    }
+
+            # --- RBAC check ---
+            result = check_permission(tool_name, args, ctx, supabase=self.supabase_client)
+            if not result.allowed:
+                logger.warning(f"RBAC denied '{tool_name}' for role='{ctx.get('user_role')}': {result.reason}")
+                return {
+                    "messages": [
+                        ToolMessage(
+                            tool_call_id=tool_call["id"],
+                            content=f"PERMISSION_DENIED: {result.reason}",
+                        )
+                    ]
+                }
+
+        return {}
+
+    def _route_after_validation(self, state: AgentState) -> str:
+        messages = state["messages"]
+        last_msg = messages[-1]
+        error_count = 0
+        for msg in reversed(messages[-6:]):
+            if isinstance(msg, ToolMessage) and (
+                "ERROR:" in str(msg.content) or "PERMISSION_DENIED:" in str(msg.content)
+            ):
+                error_count += 1
+            elif isinstance(msg, SystemMessage) and "CRITICAL" in str(msg.content):
+                error_count += 1
+        if error_count >= 2:
+            logger.error("Circuit breaker triggered: Stopping infinite LLM loop.")
+            return "human_handoff"
+
+        if isinstance(last_msg, ToolMessage) and (
+            "ERROR:" in last_msg.content or "PERMISSION_DENIED:" in last_msg.content
+        ):
+            return f"execute_{state['current_agent']}"
+
+        if isinstance(last_msg, SystemMessage) and "CRITICAL" in str(last_msg.content):
+            return f"execute_{state['current_agent']}"
+
+        return "tools"
+
+    def _supervisor_node(self, state: AgentState) -> Dict[str, Any]:
+        return {}
+
+    def _supervisor_route(self, state: AgentState) -> str:
+        messages = state["messages"]
+        if not messages:
+            return END
+
+        last_msg = messages[-1]
+        if isinstance(last_msg, ToolMessage):
+            if "ERROR:" in str(last_msg.content) or "PERMISSION_DENIED:" in str(last_msg.content):
+                return "human_handoff"
+            return "router"
+
+        if isinstance(last_msg, SystemMessage) and "CRITICAL" in str(last_msg.content):
+            return "human_handoff"
+
+        return END
+
+    def _execute_agent_node(self, agent_name: str):
+
+        def node(state: AgentState) -> Dict[str, Any]:
+            
+            ctx = state.get("transaction_context", {})
+            user_id = ctx.get("current_user_id")
+            
+            # If no user_id AND agent is not 'discovery', block immediately.
+            if agent_name != "discovery" and not user_id:
+                logger.warning(f"Unauthenticated access attempt blocked for agent: {agent_name}")
+                return {
+                    "messages": [
+                        AIMessage(
+                            content="Authentication required. Please log in to access this feature."
+                        )
+                    ]
+                }
+                
+            manifest = self.registry.resolve_agent(agent_name)
+            all_tools = self.oracle.get_all_tools()
+            authorized_tool_names = manifest.authorized_mcp_tools
+            ctx = state.get("transaction_context", {})
+            system_msg = SystemMessage(
+                content=(
+                        f"{manifest.system_instructions}\n\n"
+                        f"{self._format_plan_instructions(state.get('agent_plan'))}\n"
+                        "IDENTITY RULE: Never ask the user for their ID, role, or system identifier. "
+                        "These are injected automatically by the platform."
+                    )
+            )
+            
+            all_tool_names = [t.name for t in all_tools]
+            
+            for name in authorized_tool_names:
+                if name not in all_tool_names:
+                    logger.error(f"CONFIG ERROR: Agent '{agent_name}' is authorized to use '{name}', "
+                                f"but this tool is not in the Oracle list: {all_tool_names}")
+
+            allowed_tools = [t for t in all_tools if t.name in authorized_tool_names]
+            llm_with_tools = self.llm.bind_tools(allowed_tools, tool_choice="auto")
+
+            try:
+                response = llm_with_tools.invoke([system_msg] + state["messages"])
+
+                if response.tool_calls:
+                    for tc in response.tool_calls:
+                        tool_name = tc["name"]
+
+                        # --- Fix 1, 2, 3: unified auto-injection via AUTO_INJECT map ---
+                        injections = AUTO_INJECT.get(tool_name, {})
+                        for arg_key, ctx_key in injections.items():
+                            value = ctx.get(ctx_key)
+                            if value is not None:
+                                tc["args"][arg_key] = value
+
+                        # Strip any protected arg the LLM hallucinated
+                        protected = PROTECTED_ARGS.get(tool_name, set())
+                        tc["args"] = {
+                            k: v for k, v in tc["args"].items()
+                            if v is not None and (k not in protected or k in injections)
+                        }
+
+                        if tool_name not in authorized_tool_names:
+                            return {
+                                "messages": [
+                                    AIMessage(
+                                        content=(
+                                            f"ERROR: You are not authorized to use '{tool_name}'. "
+                                            f"You may only use: {', '.join(authorized_tool_names)}."
+                                        )
+                                    )
+                                ]
+                            }
+
+                new_context = self._update_agent_memory(state, agent_name, response)
+                return {
+                    "messages": [response],
+                    "current_agent": agent_name,
+                    "transaction_context": new_context,
+                }
+
+            except Exception as e:
+                logger.error(f"Execution error in agent '{agent_name}': {e}")
+                return {
+                    "messages": [
+                        AIMessage(
+                            content=(
+                                "SYSTEM ERROR: The previous attempt to use a tool failed because the output "
+                                "was incorrectly formatted. You MUST use the provided tool-calling API. "
+                                "Do not output plain text descriptions of the tool. Call the tool directly."
+                            )
+                        )
+                    ]
+                }
+
+        return node
+
+    # ------------------------------------------------------------------
+    # Graph wiring
+    # ------------------------------------------------------------------
+
+    def _build_workflow_graph(self) -> Any:
+        workflow = StateGraph(AgentState)
+        workflow.add_node("router", self.router_node)
+        workflow.add_node("planner", self._plan_node)
+        workflow.add_node("validate_tools", self._validate_tool_calls)
+        workflow.add_node("tools", ToolNode(self.oracle.get_all_tools()))
+        workflow.add_node("supervisor", self._supervisor_node)
+        workflow.add_node("human_handoff", self._human_handoff_node)
+
+        for manifest in self.registry.get_all_manifests():
+            workflow.add_node(f"execute_{manifest.name}", self._execute_agent_node(manifest.name))
+
+        workflow.add_edge(START, "router")
+
+        def route_from_router(state: AgentState):
+            agent = state.get("current_agent")
+            return END if agent == "end" else "planner"
+
+        workflow.add_conditional_edges("router", route_from_router)
+        workflow.add_conditional_edges("planner", lambda state: f"execute_{state['current_agent']}")
+
+        for manifest in self.registry.get_all_manifests():
+            node_name = f"execute_{manifest.name}"
+
+            def create_agent_router(agent_name):
+
+                def route(state: AgentState):
+                    if agent_name == "discovery" and self._check_search_loop(state) == "stop_and_ask_user":
+                        return "human_handoff"
+
+                    messages = state["messages"]
+                    if messages:
+                        last_msg = messages[-1]
+                        if isinstance(last_msg, AIMessage) and hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                            return "validate_tools"
+                        if isinstance(last_msg, AIMessage) and isinstance(last_msg.content, str):
+                            if "function=" in last_msg.content or "tool_call" in last_msg.content:
+                                return "validate_tools"
+                    return "supervisor"
+
+                return route
+
+            workflow.add_conditional_edges(
+                node_name,
+                create_agent_router(manifest.name),
+                {
+                    "validate_tools": "validate_tools",
+                    "human_handoff": "human_handoff",
+                    "supervisor": "supervisor",
+                    END: END,
+                },
+            )
+
+        workflow.add_edge("tools", "supervisor")
+        workflow.add_conditional_edges("validate_tools", self._route_after_validation)
+        workflow.add_conditional_edges("supervisor", self._supervisor_route)
+
+        return workflow
 </file>
 
 <file path="data_layer/schemas/add_property_input.py">
@@ -2650,6 +2854,189 @@ class CartesiaStreamingClient:
                             break
 </file>
 
+<file path="data_layer/mcp_tour.py">
+import json
+import logging
+from typing import Dict, Any, Optional, cast
+from langchain_core.tools import tool
+from pydantic import BaseModel
+from supabase import Client
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+_supabase_client: Optional[Client] = None
+
+
+def set_client(client: Client) -> None:
+    global _supabase_client
+    _supabase_client = client
+
+
+def _get_client() -> Client:
+    if _supabase_client is None:
+        raise RuntimeError("Supabase client not initialized.")
+    return _supabase_client
+
+
+class GetTourDetailsSchema(BaseModel):
+    tour_id: str
+
+
+@tool
+def schedule_tour(
+    property_id: str,
+    tour_date: str,
+    renter_id: Optional[str]=None,
+    visitor_name: Optional[str]=None,
+    visitor_contact: Optional[str]=None
+) -> Dict[str, Any]:
+    """Schedules a new property tour. tour_date format: YYYY-MM-DDTHH:MM:SS or natural language like '2026-06-15 at 2:00 PM'
+     IMPORTANT: tour_date is REQUIRED and must be explicitly provided by the user.
+    Format: YYYY-MM-DDTHH:MM:SS (e.g., '2026-06-20T14:00:00').
+    Do NOT call this tool until the user has confirmed both a date AND a time.
+    If either is missing, ask the user before proceeding.
+    """
+    client = _get_client()
+    try:
+        if not tour_date or tour_date.strip().lower() in ("", "none", "tbd", "unknown"):
+            return {"status": "ERROR", "message": "Tour date and time are required. Please ask the user to provide a specific date and time."}
+
+        # If renter_id is provided, fetch user details from profile
+        if renter_id:
+            user_response = client.table("profiles").select("*").eq("id", renter_id).maybe_single().execute()
+            if user_response is not None and user_response.data:
+                user_data = cast(Dict[str, Any], user_response.data)
+                visitor_name = user_data.get("full_name")
+                visitor_contact = user_data.get("phone")
+            else:
+                return {"status": "ERROR", "message": "Renter profile not found."}
+        
+        # Validate required fields
+        if not visitor_name or not visitor_contact:
+            return {"status": "ERROR", "message": "Visitor name and contact information are required."}
+        
+        response = client.table("tours").insert({
+            "property_id": property_id,
+            "visitor_id": renter_id,
+            "visitor_name": visitor_name,
+            "visitor_contact": visitor_contact,
+            "tour_date": tour_date,
+            "status": "pending",
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+        
+        if response.data:
+            item = cast(Dict[str, Any], response.data[0])
+            return {"status": "SUCCESS", "tour_id": item.get("id"), "message": "Tour scheduled successfully. The landlord will confirm shortly."}
+        return {"status": "ERROR", "message": "Failed to schedule tour."}
+    except Exception as e:
+        logger.error(f"Schedule tour error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool(args_schema=GetTourDetailsSchema)
+def get_tour_details(tour_id: str) -> str:
+    """Fetches details of a specific tour by ID."""
+    try:
+        client = _get_client()
+        response = client.table("tours").select("*, properties(address)").eq("id", tour_id).maybe_single().execute()
+        
+        if response is None:
+            return "error: Internal Database Error"
+        if response.data is None:
+            return "error: Tour not found"
+        return json.dumps({"status": "SUCCESS", "data": response.data})
+    except Exception as e:
+        return json.dumps({"status": "ERROR", "message": str(e)})
+
+
+@tool
+def update_tour(tour_id: str, status: str) -> str:
+    """Updates the status of a tour (e.g., 'confirmed', 'cancelled')."""
+    client = _get_client()
+    response = client.table("tours").update({"status": status}).eq("id", tour_id).execute()
+    if not response.data:
+        return json.dumps({"status": "ERROR", "message": "Update failed"})
+    return json.dumps({"status": "SUCCESS"})
+
+
+@tool
+def view_tour_requests(property_id: str) -> Dict[str, Any]:
+    """Landlord views all tour requests for a property."""
+    client = _get_client()
+    try:
+        response = client.table("tours").select("*").eq("property_id", property_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "tour_requests": response.data, "count": len(response.data)}
+        return {"status": "SUCCESS", "tour_requests": [], "count": 0, "message": "No tour requests yet."}
+    except Exception as e:
+        logger.error(f"View tour requests error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def approve_tour_request(tour_id: str) -> Dict[str, Any]:
+    """Landlord approves a tour request."""
+    client = _get_client()
+    try:
+        response = client.table("tours").update({"status": "approved"}).eq("id", tour_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "message": "Tour approved. Visitor will receive confirmation."}
+        return {"status": "ERROR", "message": "Failed to approve tour."}
+    except Exception as e:
+        logger.error(f"Approve tour request error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def deny_tour_request(tour_id: str, reason: str="") -> Dict[str, Any]:
+    """Landlord denies a tour request."""
+    client = _get_client()
+    try:
+        response = client.table("tours").update({
+            "status": "denied",
+            "denial_reason": reason
+        }).eq("id", tour_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "message": "Tour request denied."}
+        return {"status": "ERROR", "message": "Failed to deny tour request."}
+    except Exception as e:
+        logger.error(f"Deny tour request error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def reschedule_tour(tour_id: str, new_date: str) -> Dict[str, Any]:
+    """Landlord reschedules a tour to a new date."""
+    client = _get_client()
+    try:
+        response = client.table("tours").update({
+            "tour_date": new_date,
+            "status": "rescheduled"
+        }).eq("id", tour_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "message": "Tour rescheduled successfully."}
+        return {"status": "ERROR", "message": "Failed to reschedule tour."}
+    except Exception as e:
+        logger.error(f"Reschedule tour error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+
+
+@tool
+def get_renter_tour_requests(renter_id: str) -> Dict[str, Any]:
+    """Renter views all their tour requests."""
+    client = _get_client()
+    try:
+        response = client.table("tours").select("*").eq("visitor_id", renter_id).execute()
+        if response.data:
+            return {"status": "SUCCESS", "tours": response.data, "count": len(response.data)}
+        return {"status": "SUCCESS", "tours": [], "count": 0, "message": "You have no tour requests yet."}
+    except Exception as e:
+        logger.error(f"Get renter tour requests error: {e}")
+        return {"status": "ERROR", "message": str(e)}
+</file>
+
 <file path="pyproject.toml">
 [project]
 name = "house-padi-backend"
@@ -2710,7 +3097,8 @@ class HousePadiSystem:
             registry=self.registry,
             llm_client=llm,
             oracle=self.oracle,
-            db_url=os.getenv("DATABASE_URL") or ""
+            db_url=os.getenv("DATABASE_URL") or "",
+            supabase_client=self.supabase
         )
         
         # 5. Voice Layer
@@ -2734,32 +3122,6 @@ class HousePadiSystem:
             raise EnvironmentError("CARTESIA_API_KEY missing.")
             
         logger.info("✅ Voice Service Configs validated.")
-</file>
-
-<file path="agent_engine/prompts.json">
-{
-  "discovery": {
-    "system_instructions": "### Role: House Padi Discovery Expert\n**Core Objective:** Find properties using `search_semantic_listings`.\n\n### Formatting Rules (CRITICAL)\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO CONVERSATIONAL TEXT WITH TOOLS:** When calling a tool, output ONLY the tool call. Do not add introductory or concluding text (e.g., 'Here is the search results:' or 'I am searching now').\n- **NO TEXT TAGS:** You are forbidden from using <function=...>, call(), or any text-based wrapper. Use the native JSON tool-calling interface ONLY.\n- **Constraint:** If you have search results, translate them into a natural response. If you have no results, pivot to a concierge suggestion without retrying.\n\n### Dynamic Filtering\n- Extract filters into JSON (e.g., {\"bedrooms\": 2, \"pool\": true}) and pass to `search_semantic_listings`."
-  },
-  "broker": {
-    "system_instructions": "### Role: House Padi Real Estate Concierge\n**Core Objective:** Gather property details and save them using `add_new_property_record`.\n\n### CRITICAL FORMATTING RULES (ENFORCED)\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO PSEUDO-CODE:** You are strictly forbidden from writing text that looks like code, APIs, or function wrappers. DO NOT use words like `function=`, `<function>`, `(function)`, or JSON blocks in your conversational text.\n- **STAY IN CHARACTER:** You are a human-like concierge. If you need the address, just ask for the address and STOP. Do not attempt to search the web or run tools to find it for them.\n- **TOOL USAGE:** Only use the native tool-calling interface, and only do so when you have explicitly gathered all required data from the user.\n\n### STRICT INPUT GATHERING\n- If a required field is missing, ask the user and wait for their response. Do not guess, do not autocomplete, and do not use search engines."
-  },
-  "manager": {
-    "system_instructions": "### Role: House Padi Property Caretaker\n**Core Objective:** Manage property records.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO PREAMBLE:** When calling `update_property` or others, emit ONLY the tool call. No 'I am updating this' or 'Process complete'.\n- **No Tags:** Do not use <function=...> or similar. Native tool-calling only.\n- **Workflow:** Always validate UUIDs before acting. If an operation fails, apologize professionally and request to retry."
-  },
-  "identity": {
-    "system_instructions": "### Role: House Padi Account Assistant\n**Core Objective:** Retrieve and update profile info.\n\n### Rules\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- Use `get_user_profile` and `update_user_profile` via native tool calls only. No conversational headers when executing tools."
-  },
-  "tour": {
-    "system_instructions": "### Role: Tour Agent\n**Core Objective:** Coordinate property tours for both renters and landlords.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO TEXT TAGS:** Native tool calling only. Never use <function=...>.\n- **SILENT EXECUTION:** If you call a tool, do not precede it with conversation. If you need to speak to the user, send a separate message after the tool has successfully executed.\n\n### Tour Scheduling (STRICT)\n- Before calling `schedule_tour`, you MUST have BOTH a specific date AND a specific time from the user.\n- If the user has not provided a date, ask: 'What date would you like to schedule the tour?'\n- If the user has not provided a time, ask: 'What time works best for you?'\n- Do NOT call `schedule_tour` with a vague, assumed, or placeholder date. WAIT for the user to confirm.\n- Once both date and time are confirmed, call `schedule_tour` with ONLY `property_id` and `tour_date`.\n- The `renter_id` is automatically injected by the system. NEVER ask the user for their ID.\n- For landlord tour management, use `view_tour_requests`, `approve_tour_request`, `deny_tour_request`, and `reschedule_tour`."
-  },
-  "renter": {
-    "system_instructions": "### Role: Renter Assistant\n**Core Objective:** Help renters with property interest, tours, applications, and lease management.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** Keep all responses natural and conversational. Never show JSON, raw data, or technical details to the user.\n- **NO TEXT TAGS:** Use native tool-calling only. Never format tools as text.\n- **GUIDANCE:** Help the renter navigate the leasing process: express interest -> book tours -> apply -> sign lease.\n- **EMPATHY:** Be supportive and guide them through each step. Explain what is happening in simple terms.\n\n### Tour Scheduling (STRICT)\n- Before calling `schedule_tour`, you MUST have BOTH a specific date AND a specific time confirmed by the user.\n- If the user says 'tomorrow' or 'next week', ask them to confirm the exact date.\n- If no time is given, ask: 'What time would you prefer for the tour?'\n- Do NOT call `schedule_tour` until you have an explicit date and time. STOP and ask if anything is missing.\n- Call `schedule_tour` with ONLY `property_id` and `tour_date`.\n- The `renter_id` is automatically injected by the system. NEVER ask the user for their ID.\n- Always read back the confirmed date and time to the user before calling the tool."
-  },
-  "landlord": {
-    "system_instructions": "### Role: Landlord Assistant\n**Core Objective:** Help landlords manage tour requests, view applications, and handle lease agreements.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** All responses must be natural and conversational. No JSON, raw data, or technical jargon.\n- **NO TEXT TAGS:** Use native tool-calling only. Never format tools as text.\n- **WORKFLOW:** Enable landlords to: approve/deny tour requests, manage application approvals/denials, create and sign leases, and view property details.\n- **PROFESSIONALISM:** Maintain a professional and helpful tone when dealing with applications and tour requests."
-  }
-}
 </file>
 
 <file path="data_layer/mcp_discovery.py">
@@ -2827,134 +3189,28 @@ def create_search_tool(model, client):
     return search_semantic_listings
 </file>
 
-<file path="main.py">
-import logging
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage
-from pydantic import BaseModel
-
-# Ensure this matches your file structure
-from system_container import HousePadiSystem 
-
-# 1. Configuration
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("house_padi_server")
-
-
-# 2. Bridge Adapter
-class FastAPIWebSocketAdapter:
-    """
-    Adapts the FastAPI WebSocket to the interface required 
-    by AudioStreamOrchestrator (send + __aiter__).
-    """
-
-    def __init__(self, websocket: WebSocket):
-        self.websocket = websocket
-
-    async def send(self, data: bytes):
-        """Sends audio data from the system to the client."""
-        await self.websocket.send_bytes(data)
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        """Receives audio data from the client, converts to stream."""
-        try:
-            data = await self.websocket.receive_bytes()
-            return data
-        except WebSocketDisconnect:
-            raise StopAsyncIteration
-
-
-# 3. Lifespan Manager (Modern Replacement for on_event)
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Handles startup and shutdown lifecycle."""
-    try:
-        # Startup
-        app.state.system = HousePadiSystem()
-        app.state.system.run_health_check()
-        logger.info("--- House Padi System Operational & Ready ---")
-    except Exception as e:
-        logger.error(f"System failed to initialize: {e}")
-        raise e
-    
-    yield  # Application running
-    
-    # Shutdown
-    logger.info("--- House Padi System Shutting Down ---")
-
-
-# 4. App Initialization
-app = FastAPI(lifespan=lifespan)
-
-# 5. Routes
-
-
-class UserInput(BaseModel):
-    text: str
-    session_id:str = "default_session"
-
-
-@app.post("/api/chat")
-async def handle_text_chat(input: UserInput, request: Request):
-    """
-    Direct text input endpoint. 
-    Returns the text content of the final message.
-    """
-    try:
-        user_id = request.headers.get("X-User-ID")
-        orchestrator = app.state.system.orchestrator
-        payload = {
-            "messages": [HumanMessage(content=input.text)],
-            "transaction_context": {"current_user_id": user_id}
-        }
-        config = {"configurable": {"thread_id": input.session_id}}
-        
-        # 1. Invoke the graph
-        result = await orchestrator.graph.ainvoke(payload, config=config)
-        
-        # 2. Extract the last message content safely
-        messages = result.get("messages", [])
-        if messages:
-            final_message = messages[-1]
-            # If it's a LangChain message object, access .content
-            content = getattr(final_message, "content", str(final_message))
-        else:
-            content = "I'm sorry, I couldn't generate a response."
-            
-        return {"response": content}
-        
-    except Exception as e:
-        # Log the full traceback to identify where '__end__' is coming from
-        logger.exception("Error in text chat")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-@app.websocket("/ws/voice")
-async def voice_endpoint(websocket: WebSocket):
-    """
-    Entry point for real-time voice streaming.
-    """
-    await websocket.accept()
-    adapter = FastAPIWebSocketAdapter(websocket)
-    
-    try:
-        # Inject the adapter into the existing voice pipeline
-        await app.state.system.voice_handler.handle_voice_session(adapter)
-    except WebSocketDisconnect:
-        logger.info("Client connection closed.")
-    except Exception as e:
-        logger.error(f"Voice session error: {e}")
-
-
-if __name__ == "__main__":
-    import uvicorn
-    # Start the server
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+<file path="agent_engine/prompts.json">
+{
+  "discovery": {
+    "system_instructions": "### Role: House Padi Discovery Expert\n**Core Objective:** Find properties using `search_semantic_listings`.\n\n### Formatting Rules (CRITICAL)\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO CONVERSATIONAL TEXT WITH TOOLS:** When calling a tool, output ONLY the tool call. Do not add introductory or concluding text (e.g., 'Here is the search results:' or 'I am searching now').\n- **NO TEXT TAGS:** You are forbidden from using <function=...>, call(), or any text-based wrapper. Use the native JSON tool-calling interface ONLY.\n- **Constraint:** If you have search results, translate them into a natural response. If you have no results, pivot to a concierge suggestion without retrying.\n\n### Dynamic Filtering\n- Extract filters into JSON (e.g., {\"bedrooms\": 2, \"pool\": true}) and pass to `search_semantic_listings`."
+  },
+  "broker": {
+    "system_instructions": "### Role: House Padi Real Estate Concierge\n**Core Objective:** Gather property details and save them using `add_new_property_record`.\n\n### CRITICAL FORMATTING RULES (ENFORCED)\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO PSEUDO-CODE:** You are strictly forbidden from writing text that looks like code, APIs, or function wrappers. DO NOT use words like `function=`, `<function>`, `(function)`, or JSON blocks in your conversational text.\n- **STAY IN CHARACTER:** You are a human-like concierge. If you need the address, just ask for the address and STOP. Do not attempt to search the web or run tools to find it for them.\n- **TOOL USAGE:** Only use the native tool-calling interface.\n\n### EXECUTION PROTOCOL (CRITICAL)\n- **VALIDATE DATA:** Before responding, check if you have all required fields: address, base_price, location, and specs (bedrooms/bathrooms).\n- **IF DATA COMPLETE:** You MUST invoke the `add_new_property_record` tool IMMEDIATELY. Do not reply to the user with a text summary or confirmation. The act of calling the tool is your signal to the system that you have accepted the data.\n- **IF DATA INCOMPLETE:** Ask the user for the missing information and STOP. Do not guess, do not autocomplete, and do not use search engines.\n\n### STRICT INPUT GATHERING\n- If a required field is missing, ask the user and wait for their response."
+  },
+  "manager": {
+    "system_instructions": "### Role: House Padi Property Caretaker\n**Core Objective:** Manage property records.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- **NO PREAMBLE:** When calling `update_property` or others, emit ONLY the tool call. No 'I am updating this' or 'Process complete'.\n- **No Tags:** Do not use <function=...> or similar. Native tool-calling only.\n- **Workflow:** Always validate UUIDs before acting. If an operation fails, apologize professionally and request to retry."
+  },
+  "identity": {
+    "system_instructions": "### Role: House Padi Account Assistant\n**Core Objective:** Retrieve and update profile info.\n\n### Rules\n- **HUMAN-READABLE ONLY:** Any conversational response to the user must be in natural, easy-to-read language. Do not output raw data, JSON schemas, or technical jargon to the user.\n- Use `get_user_profile` and `update_user_profile` via native tool calls only. No conversational headers when executing tools."
+  },
+  
+  "renter": {
+    "system_instructions": "### Role: Renter Assistant\n**Core Objective:** Help renters with property interest, tours, applications, and lease management.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** Keep all responses natural and conversational. Never show JSON, raw data, or technical details to the user.\n- **NO TEXT TAGS:** Use native tool-calling only. Never format tools as text.\n- **GUIDANCE:** Help the renter navigate the leasing process: express interest -> book tours -> apply -> sign lease.\n- **EMPATHY:** Be supportive and guide them through each step. Explain what is happening in simple terms.\n\n### Tour Scheduling (STRICT)\n- Before calling `schedule_tour`, you MUST have BOTH a specific date AND a specific time confirmed by the user.\n- If the user says 'tomorrow' or 'next week', ask them to confirm the exact date.\n- If no time is given, ask: 'What time would you prefer for the tour?'\n- Do NOT call `schedule_tour` until you have an explicit date and time. STOP and ask if anything is missing.\n- Call `schedule_tour` with ONLY `property_id` and `tour_date`.\n- The `renter_id` is automatically injected by the system. NEVER ask the user for their ID.\n- Always read back the confirmed date and time to the user before calling the tool."
+  },
+  "landlord": {
+    "system_instructions": "### Role: Landlord Assistant\n**Core Objective:** Help landlords manage tour requests, view applications, and handle lease agreements.\n\n### Critical Formatting Rules\n- **HUMAN-READABLE ONLY:** All responses must be natural and conversational. No JSON, raw data, or technical jargon.\n- **NO TEXT TAGS:** Use native tool-calling only. Never format tools as text.\n- **WORKFLOW:** Enable landlords to: approve/deny tour requests, manage application approvals/denials, create and sign leases, and view property details.\n- **PROFESSIONALISM:** Maintain a professional and helpful tone when dealing with applications and tour requests."
+  }
+}
 </file>
 
 <file path="agent_engine/registry.py">
@@ -3074,17 +3330,17 @@ class HousePadiAgentRegistry:
         ))
         
         # 4. Tour Agent
-        self.register_agent(AgentManifest(
-            name="tour",
-            description="Handles tour scheduling, updates, and confirmations.",
-            system_instructions=self.prompts.get("tour", {}).get("system_instructions", ""),
-            authorized_mcp_tools=["schedule_tour", "get_tour_details", "update_tour", "search_semantic_listings"]
-        ))
+        # self.register_agent(AgentManifest(
+        #     name="tour",
+        #     description="Handles tour scheduling, updates, and confirmations.",
+        #     system_instructions=self.prompts.get("tour", {}).get("system_instructions", ""),
+        #     authorized_mcp_tools=["schedule_tour", "get_tour_details", "update_tour", "search_semantic_listings"]
+        # ))
 
         # 5. Renter Agent
         self.register_agent(AgentManifest(
             name="renter",
-            description="Helps renters find properties, book tours, apply for leases, and manage lease agreements.",
+            description="Helps renters find properties, book tours, create applications for properties and manage lease agreements.",
             system_instructions=self.prompts.get("renter", {}).get("system_instructions", ""),
             authorized_mcp_tools=[
                 "search_semantic_listings",
@@ -3097,7 +3353,8 @@ class HousePadiAgentRegistry:
                 "get_lease_details",
                 "get_active_leases",
                 "get_user_profile",
-                "update_user_profile"
+                "update_user_profile",
+                "view_application_details",
             ]
         ))
 
@@ -3128,6 +3385,283 @@ class HousePadiAgentRegistry:
 
     def is_valid_agent(self, name: str) -> bool:
         return name in self._registry
+</file>
+
+<file path="main.py">
+import logging
+from contextlib import asynccontextmanager
+from typing import Literal
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
+
+from middleware.auth_gateway import AuthGatewayMiddleware
+from system_container import HousePadiSystem
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("house_padi_server")
+
+
+class FastAPIWebSocketAdapter:
+
+    def __init__(self, websocket: WebSocket):
+        self.websocket = websocket
+
+    async def send(self, data: bytes):
+        await self.websocket.send_bytes(data)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return await self.websocket.receive_bytes()
+        except WebSocketDisconnect:
+            raise StopAsyncIteration
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        app.state.system = HousePadiSystem()
+        app.state.system.run_health_check()
+        logger.info("--- House Padi System Operational & Ready ---")
+    except Exception as e:
+        logger.error(f"System failed to initialize: {e}")
+        raise e
+    yield
+    logger.info("--- House Padi System Shutting Down ---")
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    AuthGatewayMiddleware,
+)
+
+
+class UserInput(BaseModel):
+    text: str
+    session_id: str = "default_session"
+
+    
+class RoleUpdateRequest(BaseModel):
+    target_user_id: str
+    role: Literal['landlord', 'renter', 'admin']
+    action: str  # "grant" or "revoke"
+    expires_at: str | None = None  # ISO datetime string, optional
+    
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    full_name: str
+    phone: str | None = None
+    role: Literal['landlord', 'renter', 'admin']
+
+
+async def resolve_user_context(user_id: str | None, supabase) -> dict:
+    """
+    No user_id = unauthenticated request.
+    We don't assign 'guest' — we just return no user_id and no roles.
+    The permission check handles this by only allowing tools that are
+    explicitly open to unauthenticated callers.
+    """
+    if not user_id:
+        return {"current_user_id": None, "user_role": None, "user_roles": []}
+
+    try:
+        resp = (
+            supabase.table("user_roles")
+            .select("roles(name)")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        roles = [row["roles"]["name"] for row in (resp.data or []) if row.get("roles")]
+        if "admin" in roles:
+            primary_role = "admin"
+        elif "landlord" in roles and "renter" in roles:
+            primary_role = "landlord"
+        elif roles:
+            primary_role = roles[0]
+        else:
+            primary_role = None
+        return {"current_user_id": user_id, "user_role": primary_role, "user_roles": roles}
+    except Exception as e:
+        logger.error(f"Failed to resolve roles for user_id={user_id}: {e}")
+        primary_role = None
+        return {"current_user_id": user_id, "user_role": primary_role, "user_roles": []}
+    
+    
+    
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+@app.post("/api/auth/login")
+async def login_user(body: LoginRequest):
+    supabase = app.state.system.supabase
+    try:
+        # Supabase handles password verification
+        auth_response = supabase.auth.sign_in_with_password({
+            "email": body.email,
+            "password": body.password
+        })
+        
+        # Return the session details to the client
+        return {
+            "access_token": auth_response.session.access_token,
+            "refresh_token": auth_response.session.refresh_token,
+            "user": {
+                "id": auth_response.user.id,
+                "email": auth_response.user.email
+            }
+        }
+    except Exception as e:
+        logger.error(f"Login failed: {e}")
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+
+@app.post("/api/auth/register")
+async def register_user(body: RegisterRequest):
+    supabase = app.state.system.supabase
+
+    # 1. Just call sign_up
+    # If this fails, NOTHING happens. No need to delete.
+    try:
+        auth_response = supabase.auth.sign_up({
+            "email": body.email,
+            "password": body.password,
+            "options": {
+                "data": {
+                    "full_name": body.full_name,
+                    "phone": body.phone,
+                    "role": body.role
+                }
+            }
+        })
+    except Exception as e:
+        # The database trigger failure will bubble up here.
+        # Just log it and tell the user it failed.
+        logger.error(f"Signup failed: {e}")
+        raise HTTPException(status_code=400, detail="Registration failed.")
+
+    return {"message": "Success"}
+
+
+@app.post("/api/admin/users/roles")
+async def update_user_role(body: RoleUpdateRequest, request: Request):
+    """
+    Grant or revoke a role for a user.
+    Caller must be an admin — role is verified from DB, not the request.
+    """
+    admin_user_id = request.headers.get("X-User-ID")
+    supabase = app.state.system.supabase
+
+    # Verify the caller is actually an admin
+    caller_ctx = await resolve_user_context(admin_user_id, supabase)
+    if caller_ctx["user_role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can update roles.")
+
+    # Validate the role exists
+    role_resp = supabase.table("roles").select("id").eq("name", body.role).maybe_single().execute()
+    if not role_resp or not role_resp.data:
+        raise HTTPException(status_code=400, detail=f"Role '{body.role}' does not exist.")
+    role_id = role_resp.data["id"]
+
+    if body.action == "grant":
+        payload = {
+            "user_id": body.target_user_id,
+            "role_id": role_id,
+            "granted_by": admin_user_id,
+        }
+        if body.expires_at:
+            payload["expires_at"] = body.expires_at
+
+        supabase.table("user_roles").upsert(payload, on_conflict="user_id,role_id").execute()
+
+        # Refresh the materialized view so permissions take effect immediately
+        supabase.rpc("refresh_user_permissions").execute()
+        return {"status": "SUCCESS", "message": f"Role '{body.role}' granted to user."}
+
+    elif body.action == "revoke":
+        supabase.table("user_roles").delete()\
+            .eq("user_id", body.target_user_id)\
+            .eq("role_id", role_id)\
+            .execute()
+
+        supabase.rpc("refresh_user_permissions").execute()
+        return {"status": "SUCCESS", "message": f"Role '{body.role}' revoked from user."}
+
+    else:
+        raise HTTPException(status_code=400, detail="action must be 'grant' or 'revoke'.")
+
+
+@app.post("/api/chat")
+async def handle_text_chat(input: UserInput, request: Request):
+    """
+    Text chat endpoint.
+
+    Expected headers
+    ----------------
+    X-User-ID : UUID of the authenticated user (set by your auth middleware/gateway).
+                Role is resolved from the database — never from the client.
+    """
+    try:
+        user_id = getattr(request.state, "user_id", None)
+        supabase = app.state.system.supabase
+
+        # Role is always fetched from DB — client cannot spoof it
+        user_context = await resolve_user_context(user_id, supabase)
+
+        orchestrator = app.state.system.orchestrator
+        config = {"configurable": {"thread_id": input.session_id}}
+
+        # Fetch existing checkpoint state and merge so context survives multi-turn
+        existing_state = await orchestrator.graph.aget_state(config)
+        existing_ctx = {}
+        if existing_state and existing_state.values:
+            existing_ctx = existing_state.values.get("transaction_context", {}) or {}
+
+        merged_context = {
+            **existing_ctx,
+            **user_context,
+        }
+
+        payload = {
+            "messages": [HumanMessage(content=input.text)],
+            "transaction_context": merged_context,
+        }
+
+        result = await orchestrator.graph.ainvoke(payload, config=config)
+
+        messages = result.get("messages", [])
+        content = getattr(messages[-1], "content", "I'm sorry, I couldn't generate a response.") if messages else "I'm sorry, I couldn't generate a response."
+
+        return {"response": content}
+
+    except Exception as e:
+        logger.exception("Error in text chat")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.websocket("/ws/voice")
+async def voice_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    adapter = FastAPIWebSocketAdapter(websocket)
+    try:
+        await app.state.system.voice_handler.handle_voice_session(adapter)
+    except WebSocketDisconnect:
+        logger.info("Client connection closed.")
+    except Exception as e:
+        logger.error(f"Voice session error: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 </file>
 
 <file path="agent_engine/graph.py">

@@ -148,3 +148,35 @@ def delete_property(property_id: str) -> Dict[str, Any]:
     return {"status": "SUCCESS"}
 
 
+@tool
+def fetch_properties_by_owner(owner_id: str) -> List[Dict[str, Any]]:
+    """
+    Retrieves all active property records belonging to a specific owner_id (UUID).
+    Use this tool when a landlord wants to see their listed properties or when verifying 
+    ownership profiles.
+    """
+    if not is_valid_uuid(owner_id):
+        raise ValueError(f"Invalid owner UUID format: {owner_id}. Must be a valid UUID.")
+        
+    client = _get_client()
+    
+    try:
+        # Fetch properties matching owner_id that have not been soft-deleted
+        response = (
+            client.table("properties")
+            .select("*")
+            .eq("owner_id", owner_id)
+            .is_("deleted_at", "null")
+            .execute()
+        )
+        
+        if response is None or response.data is None:
+            return []
+            
+        return cast(List[Dict[str, Any]], response.data)
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch properties for owner {owner_id}: {e}")
+        # Return an empty list or structural error depending on your orchestration requirements
+        return []
+
