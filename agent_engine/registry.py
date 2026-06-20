@@ -127,17 +127,11 @@ class HousePadiAgentRegistry:
             description="Helps renters book tours, apply for properties and manage lease agreements.",
             system_instructions=self.prompts.get("renter", {}).get("system_instructions", ""),
             authorized_mcp_tools=[
-                "fetch_property_by_uuid",
                 "schedule_tour",
                 "get_renter_tour_requests",
                 "apply_for_property",
                 "get_renter_applications",
-                "sign_lease",
-                "get_lease_details",
-                "get_active_leases",
-                "get_user_profile",
-                "update_user_profile",
-                "view_application_details",
+                
             ]
         ))
         self.register_agent(AgentManifest(
@@ -145,16 +139,11 @@ class HousePadiAgentRegistry:
             description="Strictly handles application creation and management.",
             system_instructions=self.prompts.get("application", {}).get("system_instructions", ""),
             authorized_mcp_tools=[
-                "fetch_property_by_uuid",
-                "apply_for_property",
-                "get_renter_applications",
-                "get_user_profile",
                 "view_application_details",
-                "approve_application",
                 "view_applications",
-                "deny_application",
-
-
+                "get_lease_details",
+                "get_active_leases",
+                "sign_lease",
             ]
         ))
 
@@ -164,18 +153,15 @@ class HousePadiAgentRegistry:
             description="Helps landlords manage properties, view tour requests, review applications, and manage leases.",
             system_instructions=self.prompts.get("landlord", {}).get("system_instructions", ""),
             authorized_mcp_tools=[
-                "fetch_property_by_uuid",
                 "view_tour_requests",
                 "approve_tour_request",
                 "deny_tour_request",
                 "reschedule_tour",
                 "create_lease",
-                "sign_lease",
-                "get_lease_details",
-                "get_active_leases",
                 "terminate_lease",
-                "get_user_profile",
                 "fetch_properties_by_owner"
+                "approve_application",
+                "deny_application",
             ]
         ))
 

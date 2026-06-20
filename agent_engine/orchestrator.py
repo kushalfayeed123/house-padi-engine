@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Annotated, Hashable, TypedDict, List, Dict, Any, Optional, Literal
 from langgraph.graph import StateGraph, START, END
@@ -5,7 +6,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import BaseMessage, SystemMessage, AIMessage, ToolMessage, HumanMessage
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, ValidationError, create_model
 from agent_engine.registry import HousePadiAgentRegistry
 from data_layer.mcp_oracle import OracleMCPServer
 from data_layer.schemas.orchestrator_client_response import OrchestratorClientResponse
@@ -217,15 +218,44 @@ class MultiAgentOrchestrator:
         entries = memory.get(active_agent, [])[-5:]
         return "\n".join([f"MEMORY: {entry}" for entry in entries])
 
-    def _merge_transaction_context(self, state: AgentState, incoming: Dict[str, Any]) -> Dict[str, Any]:
-        existing = dict(state.get("transaction_context") or {})
-        for key in ("current_user_id", "user_role"):
-            if incoming.get(key) is not None:
-                existing[key] = incoming[key]
-        for k, v in incoming.items():
-            if k not in existing:
-                existing[k] = v
-        return existing
+    def _merge_transaction_context(self, state: AgentState, new_context: dict) -> dict:
+        """
+        Scans the latest messages array for successful tool outputs and automatically
+        promotes returned entity identifiers to the global transaction state.
+        """
+        merged = dict(state.get("transaction_context", {}))
+        merged.update(new_context)
+        
+        # Dynamically find the last message if it's a ToolMessage
+        messages = state.get("messages", [])
+        if messages and type(messages[-1]).__name__ == "ToolMessage":
+            tool_msg: BaseMessage = messages[-1]
+            try:
+                import json
+                content_str = tool_msg.content
+                if isinstance(content_str, list):
+                    # Fallback / extraction strategy if content is stored in a multi-part content block list
+                    content_str = " ".join([item if isinstance(item, str) else json.dumps(item) for item in content_str])
+            
+                if isinstance(content_str, (str, bytes, bytearray)):
+                    data = json.loads(content_str)
+                    
+                    # Generic loop: if the tool returned explicit context keys, promote them
+                    if isinstance(data, dict):
+                        # Check for standard identification key patterns across your platform
+                        for key, val in data.items():
+                            if key.endswith("_id") or key in ["id", "uuid", "reference"]:
+                                # Standardize tracking format
+                                context_key = f"current_{(tool_msg.name or '').split('_')[-1]}_id" if key == "id" else key
+                                merged[context_key] = val
+                                logger.info(f"💾 Dynamic context promotion: {context_key} -> {val}")
+                else:
+                    logger.warning(f"Skipping context harvest: tool_msg.content is an unsupported type: {type(content_str)}")
+                    
+            except Exception as e:
+                logger.error(f"Failed generic tool context promotion: {e}")
+                
+        return merged
 
     def _update_agent_memory(self, state: AgentState, agent_name: str, message: BaseMessage) -> Dict[str, Any]:
         transaction_context = dict(state.get("transaction_context", {}))
@@ -339,11 +369,31 @@ class MultiAgentOrchestrator:
         if not agent_name or agent_name == "end":
             return {"agent_plan": []}
 
+        messages = state.get("messages", [])
+        updated_plan = state.get("agent_plan") or []        
+        # --- STATE-MACHINE EXECUTED STEP PURGE ---
+        # Look back to see if the user's message is a continuation of a parameter-gathering loop.
+        if len(messages) >= 3 and messages[-1].type == "human" and updated_plan:
+            current_planned_tool = updated_plan[0].get("tool_name")
+            
+            # Find the most recent AI generation and any matching tool executions before this human turn
+            last_ai_msg = next((m for m in reversed(messages[:-1]) if m.type == "ai"), None)
+            last_tool_msg = next((m for m in reversed(messages[:-1]) if m.type == "tool"), None)
+            
+            if last_ai_msg and last_tool_msg and last_tool_msg.name == current_planned_tool:
+                metadata = getattr(last_ai_msg, "response_metadata", {})
+                finish_reason = metadata.get("finish_reason") or metadata.get("kv", {}).get("finish_reason")
+                
+                # If the AI completed the summary response cleanly without asking parameter-gathering questions,
+                # the step is complete and must be removed to avoid forcing tool re-execution on the next turn.
+                if finish_reason == "stop":
+                    logger.info(f"🧹 Planned step '{current_planned_tool}' was completely executed and conversationalized. Popping stack.")
+                    updated_plan.pop(0)
+
         # --- CRITICAL DE-DUPLICATION CHECK ---
         # Look back at the conversation history. If a tool just finished executing,
         # we explicitly return an empty plan so the executor knows to write a natural
         # summary response for the user instead of calling the tool again.
-        messages = state.get("messages", [])
         if messages:
             last_message = messages[-1]
             
@@ -380,21 +430,23 @@ class MultiAgentOrchestrator:
             "AgentPlan",
             steps=(List[DynamicPlanStep], Field(description="A sequential execution plan for the chosen agent.")),
         )
-
+        
+        authorized_tools_list_str = ", ".join([f"'{t}'" for t in authorized_tools])
+        schema_dict = plan_schema.model_json_schema()
         system_instructions = (
             f"You are the planning agent for '{agent_name}'.\n"
-            "CRITICAL: You must output a valid json object matching the schema.\n"
-            "Create an ordered execution plan for the user request.\n\n"
-            f"AVAILABLE TOOLS AND THEIR EXACT JSON SCHEMAS:\n{detailed_tools_prompt}\n\n"
-            "If no tool call is required, create a single descriptive step explaining the response.\n"
-            "Output a json object with a 'steps' array where each step contains 'step_id', 'description', 'tool_name', and 'args'.\n"
-            "CRITICAL SCHEMA RULE: The 'args' object for any tool step MUST strictly match the 'Required Arguments Schema' provided above. "
-            "Do not improvise, rename, or omit keys."
+            "You must output valid JSON matching this schema:\n"
+            f"{json.dumps(schema_dict, indent=2)}\n\n"
+            "CRITICAL CONSTRAINTS:\n"
+            f"1. You may ONLY use these exact tool names: {authorized_tools_list_str}.\n"
+            "2. If a user asks for a feature, map their intent to the closest tool name above.\n"
+            "3. DO NOT hallucinate tool names. If no tool matches, return an empty steps list.\n\n"
+            f"AVAILABLE TOOLS:\n{detailed_tools_prompt}\n"
         )
 
-        safe_messages = self._trim_historical_context(state["messages"], max_tokens_estimate=1500)
-        messages = [SystemMessage(content=system_instructions)] + safe_messages
-        messages.append(
+        safe_messages = self._trim_historical_context(messages, max_tokens_estimate=1500)
+        invocation_messages = [SystemMessage(content=system_instructions)] + safe_messages
+        invocation_messages.append(
             SystemMessage(
                 content=(
                     "### IMPORTANT PLANNER EXECUTION COMMAND ###\n"
@@ -405,7 +457,7 @@ class MultiAgentOrchestrator:
             )
         )
 
-        decision = self.llm.with_structured_output(plan_schema, method="json_mode").invoke(messages)
+        decision = self.llm.with_structured_output(plan_schema, method="json_mode").invoke(invocation_messages)
         
         sanitized_steps = []
         for step in decision.steps:
@@ -419,7 +471,8 @@ class MultiAgentOrchestrator:
                 
             sanitized_steps.append(step_dict)
 
-        return {"agent_plan": sanitized_steps}
+        # Merge our evaluated plan changes back into state output safely
+        return {"agent_plan": updated_plan if updated_plan != list(state.get("agent_plan") or []) else sanitized_steps}
 
     def _human_handoff_node(self, state: AgentState) -> dict:
         return {
@@ -686,8 +739,19 @@ class MultiAgentOrchestrator:
 
                 new_context = self._update_agent_memory(state, agent_name, response)
                 merged_context = self._merge_transaction_context(state, new_context)
+                raw_plan = state.get("agent_plan")
+                updated_plan = list(raw_plan if raw_plan is not None else [])
+                if updated_plan and response.tool_calls:
+                    executed_tool_name = response.tool_calls[0]["name"]
+                    planned_tool_name = updated_plan[0].get("tool_name")
+                    
+                    # Verify that the tool called aligns with what was expected
+                    if executed_tool_name == planned_tool_name:
+                        logger.info(f"🚀 Consumed planned tool step from stack: {executed_tool_name}")
+                        updated_plan.pop(0)
                 return {
                     "messages": processed_messages,
+                    "agent_plan": updated_plan,
                     "current_agent": agent_name,
                     "transaction_context": merged_context,
                 }
